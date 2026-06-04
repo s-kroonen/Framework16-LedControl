@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Build outputs
+dist/
+build/
+*.spec.bak
+
+# PyInstaller
+*.exe
+
+# Config (user-specific)
+# Note: config is stored in %APPDATA%, not the repo
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Windows
+Thumbs.db
+Desktop.ini
