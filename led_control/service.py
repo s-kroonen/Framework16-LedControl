@@ -104,15 +104,19 @@ class ServiceLoop:
                 try:
                     stats = stats_collector.collect()
 
-                    # Screen-brightness linking
+                    # Screen-brightness linking.
+                    # renderer.brightness is the sole brightness control;
+                    # hardware brightness is always 255 (normalised at connect).
                     if cfg.link_screen_brightness:
                         screen_pct = get_screen_brightness()
                         if screen_pct is not None:
                             effective = max(5, int(screen_pct / 100.0 * cfg.brightness))
                             if effective != renderer.brightness:
                                 renderer.brightness = effective
-                                driver.set_brightness(effective)
-                                log.debug("Screen brightness %d%% → matrix %d", screen_pct, effective)
+                                log.debug(
+                                    "Screen %d%% → renderer brightness %d (ceiling %d)",
+                                    screen_pct, effective, cfg.brightness,
+                                )
 
                     frame = renderer.render(stats)
                     driver.draw_frame(frame)
@@ -147,8 +151,7 @@ class ServiceLoop:
         elif cmd.startswith("brightness:"):
             try:
                 value = max(0, min(255, int(cmd.split(":", 1)[1])))
-                renderer.brightness = value
-                driver.set_brightness(value)
+                renderer.brightness = value   # software scaling only
                 cfg.brightness = value
                 cfg.save()
             except ValueError:
@@ -176,8 +179,8 @@ class ServiceLoop:
             enabled = cmd.split(":", 1)[1] == "1"
             cfg.link_screen_brightness = enabled
             if not enabled:
+                # Restore configured brightness ceiling when unlinking
                 renderer.brightness = cfg.brightness
-                driver.set_brightness(cfg.brightness)
             cfg.save()
             log.info("Screen brightness linking: %s", "on" if enabled else "off")
 

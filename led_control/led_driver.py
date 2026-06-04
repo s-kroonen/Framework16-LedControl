@@ -84,6 +84,9 @@ class LedDriver:
                 timeout=1,
             )
             log.info("Connected to LED matrix on %s", self._port_name)
+            # Normalise hardware brightness to maximum so that all brightness
+            # control goes through software pixel scaling only (no double-multiply).
+            self._send(CMD_BRIGHTNESS, bytes([255]))
             return True
         except serial.SerialException as exc:
             log.error("Cannot open %s: %s", self._port_name, exc)
