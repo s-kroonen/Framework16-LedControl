@@ -31,6 +31,25 @@ except Exception:
     _WMI_AVAILABLE = False
 
 
+def get_screen_brightness() -> Optional[int]:
+    """
+    Return the current Windows display brightness (0–100), or None if
+    unavailable (desktop PC with no supported backlight, or pywin32 missing).
+
+    Uses the WMI root\\wmi namespace which works for most laptop displays.
+    """
+    if not _WMI_AVAILABLE:
+        return None
+    try:
+        w = wmi.WMI(namespace="root\\wmi")
+        monitors = w.WmiMonitorBrightness()
+        if monitors:
+            return int(monitors[0].CurrentBrightness)
+    except Exception:
+        pass
+    return None
+
+
 @dataclass
 class SystemStats:
     """Snapshot of system metrics at a point in time."""

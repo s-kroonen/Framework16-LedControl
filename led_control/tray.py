@@ -3,13 +3,37 @@ System tray icon and context menu.
 
 Uses pystray.  The icon is a simple 64×64 image generated with Pillow.
 All user actions are forwarded to the service loop via the command queue.
+
+Menu structure
+──────────────
+  LED Matrix Control      [header]
+  ─────────────────
+  Display mode  ▶  System bars / CPU cores / Clock / Breathe
+  ─────────────────
+  Stats shown ▶
+    ✓ CPU %
+    ✓ RAM %
+    ✓ GPU load %
+    ✓ GPU VRAM %
+    ✓ Disk %
+    ✓ Net ↓
+    ✓ Net ↑
+    ✓ CPU Temp
+    ✓ GPU Temp
+  ─────────────────
+  Brightness ▶  25% / 50% / 75% / 100%
+  Link to screen brightness  [checked]
+  ─────────────────
+  Sleep matrix
+  Wake matrix
+  ─────────────────
+  Quit
 """
 
 from __future__ import annotations
 
 import logging
 import queue
-import sys
 from typing import Callable
 
 from PIL import Image, ImageDraw
@@ -19,6 +43,8 @@ try:
     from pystray import MenuItem as Item
 except ImportError:
     pystray = None  # type: ignore
+
+from .config import ALL_STAT_KEYS, STAT_LABELS, Config
 
 log = logging.getLogger(__name__)
 
@@ -31,7 +57,7 @@ def _make_icon_image(size: int = 64) -> Image.Image:
     gap = dot
     colors = [
         (255, 120, 0),  (200, 100, 0), (255, 120, 0),
-        (200, 100, 0),  (255, 200, 50),(200, 100, 0),
+        (200, 100, 0),  (255, 200, 50), (200, 100, 0),
         (255, 120, 0),  (200, 100, 0), (255, 120, 0),
     ]
     for i, color in enumerate(colors):
@@ -51,11 +77,13 @@ class TrayIcon:
     def __init__(
         self,
         cmd_queue: "queue.Queue[str]",
+        config: Config,
         on_quit: Callable[[], None],
     ):
         self._q = cmd_queue
+        self._config = config
         self._on_quit = on_quit
-        self._icon: pystray.Icon | None = None
+        self._icon: "pystray.Icon | None" = None
 
     # ------------------------------------------------------------------
 
@@ -63,23 +91,42 @@ class TrayIcon:
         self._q.put(cmd)
 
     # ------------------------------------------------------------------
-    # Menu callbacks
+    # Callback factories
     # ------------------------------------------------------------------
 
     def _set_mode(self, mode: str):
-        def _cb(icon, item):  # noqa: ANN001
+        def _cb(icon, item):
             self._send(f"mode:{mode}")
         return _cb
 
     def _set_brightness(self, value: int):
-        def _cb(icon, item):  # noqa: ANN001
+        def _cb(icon, item):
             self._send(f"brightness:{value}")
         return _cb
 
-    def _quit_cb(self, icon, item) -> None:  # noqa: ANN001
-        self._send("quit")
-        icon.stop()
-        self._on_quit()
+    def _toggle_stat_cb(self, key: str):
+        def _cb(icon, item):
+            self._send(f"toggle_stat:{key}")
+            # Rebuild the menu so checkmarks update
+            if self._icon:
+                self._icon.menu = self._build_menu()
+        return _cb
+
+    def _stat_checked(self, key: str):
+        def _check(item) -> bool:
+            return key in self._config.bar_slots
+        return _check
+
+    def _toggle_link_brightness(self, icon, item) -> None:
+        current = self._config.link_screen_brightness
+        self._send(f"link_brightness:{'0' if current else '1'}")
+        # Optimistic local update so menu re-renders correctly
+        self._config.link_screen_brightness = not current
+        if self._icon:
+            self._icon.menu = self._build_menu()
+
+    def _link_brightness_checked(self, item) -> bool:
+        return bool(self._config.link_screen_brightness)
 
     def _sleep_cb(self, icon, item) -> None:
         self._send("sleep")
@@ -87,9 +134,25 @@ class TrayIcon:
     def _wake_cb(self, icon, item) -> None:
         self._send("wake")
 
+    def _quit_cb(self, icon, item) -> None:
+        self._send("quit")
+        icon.stop()
+        self._on_quit()
+
     # ------------------------------------------------------------------
 
-    def _build_menu(self) -> pystray.Menu:
+    def _build_menu(self) -> "pystray.Menu":
+        # Build the "Stats shown" submenu dynamically so checkmarks reflect
+        # the current bar_slots list.
+        stats_items = [
+            Item(
+                STAT_LABELS[key],
+                self._toggle_stat_cb(key),
+                checked=self._stat_checked(key),
+            )
+            for key in ALL_STAT_KEYS
+        ]
+
         return pystray.Menu(
             Item("LED Matrix Control", None, enabled=False),
             pystray.Menu.SEPARATOR,
@@ -102,20 +165,28 @@ class TrayIcon:
                     Item("Breathe",      self._set_mode("breathe")),
                 ),
             ),
+            pystray.Menu.SEPARATOR,
+            Item("Stats shown", pystray.Menu(*stats_items)),
+            pystray.Menu.SEPARATOR,
             Item(
                 "Brightness",
                 pystray.Menu(
-                    Item("25%",   self._set_brightness(64)),
-                    Item("50%",   self._set_brightness(128)),
-                    Item("75%",   self._set_brightness(192)),
-                    Item("100%",  self._set_brightness(255)),
+                    Item("25%",  self._set_brightness(64)),
+                    Item("50%",  self._set_brightness(128)),
+                    Item("75%",  self._set_brightness(192)),
+                    Item("100%", self._set_brightness(255)),
                 ),
             ),
+            Item(
+                "Link to screen brightness",
+                self._toggle_link_brightness,
+                checked=self._link_brightness_checked,
+            ),
             pystray.Menu.SEPARATOR,
-            Item("Sleep matrix",  self._sleep_cb),
-            Item("Wake matrix",   self._wake_cb),
+            Item("Sleep matrix", self._sleep_cb),
+            Item("Wake matrix",  self._wake_cb),
             pystray.Menu.SEPARATOR,
-            Item("Quit",          self._quit_cb),
+            Item("Quit", self._quit_cb),
         )
 
     # ------------------------------------------------------------------
@@ -124,7 +195,6 @@ class TrayIcon:
         """Enter the pystray event loop (blocks)."""
         if pystray is None:
             log.error("pystray is not installed; tray icon unavailable")
-            # Without a tray we just block forever so the service keeps running
             import time
             try:
                 while True:

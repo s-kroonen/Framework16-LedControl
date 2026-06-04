@@ -3,21 +3,23 @@ Background service loop.
 
 Runs in a dedicated daemon thread.  On each tick it:
   1. Collects system stats
-  2. Renders a frame for the current display mode
-  3. Pushes the frame to the LED matrix
+  2. (Optionally) reads screen brightness and scales matrix brightness
+  3. Renders a frame for the current display mode
+  4. Pushes the frame to the LED matrix
 
-Communication with the tray icon happens via a thread-safe command queue.
-
-Supported commands (strings placed in the queue by tray.py):
-  "quit"            — stop the loop and exit
-  "mode:bars"       — switch display mode
+Supported command strings (placed in the queue by tray.py):
+  "quit"                  — stop the loop and exit
+  "mode:bars"             — switch display mode
   "mode:cpu_cores"
   "mode:clock"
   "mode:breathe"
-  "brightness:180"  — set brightness (0–255)
-  "sleep"           — put matrix to sleep
-  "wake"            — wake matrix
-  "reload_config"   — re-read config from disk
+  "brightness:180"        — set brightness ceiling (0–255)
+  "toggle_stat:cpu"       — add/remove a stat from bar_slots
+  "slots:cpu,ram,gpu"     — replace bar_slots with a comma-separated list
+  "sleep"                 — put matrix to sleep
+  "wake"                  — wake matrix
+  "link_brightness:1"     — enable/disable screen-brightness linking (0/1)
+  "reload_config"         — re-read config from disk
 """
 
 from __future__ import annotations
@@ -30,7 +32,7 @@ import time
 from .config import Config
 from .led_driver import LedDriver
 from .renderer import Renderer
-from .stats import StatsCollector
+from .stats import StatsCollector, get_screen_brightness
 
 log = logging.getLogger(__name__)
 
@@ -71,10 +73,13 @@ class ServiceLoop:
         cfg = self._config
         driver = LedDriver(port=cfg.serial_port)
         driver.connect()
-        driver.wake = lambda: driver.sleep(False)
 
         stats_collector = StatsCollector()
-        renderer = Renderer(mode=cfg.mode, brightness=cfg.brightness)
+        renderer = Renderer(
+            mode=cfg.mode,
+            brightness=cfg.brightness,
+            bar_slots=list(cfg.bar_slots),
+        )
 
         # Wake the matrix
         driver.sleep(False)
@@ -99,12 +104,22 @@ class ServiceLoop:
                 last_tick = now
                 try:
                     stats = stats_collector.collect()
+
+                    # Screen-brightness linking
+                    if cfg.link_screen_brightness:
+                        screen_pct = get_screen_brightness()
+                        if screen_pct is not None:
+                            effective = max(5, int(screen_pct / 100.0 * cfg.brightness))
+                            renderer.brightness = effective
+                            driver.set_brightness(effective)
+                        # If screen brightness unavailable, keep current brightness
+
                     frame = renderer.render(stats)
                     driver.draw_frame(frame)
                 except Exception as exc:
                     log.error("Tick error: %s", exc)
 
-            time.sleep(0.05)  # yield; tight loop avoided
+            time.sleep(0.05)
 
         driver.clear()
         driver.sleep(True)
@@ -118,29 +133,64 @@ class ServiceLoop:
         renderer: Renderer,
     ) -> None:
         log.debug("Command: %s", cmd)
+        cfg = self._config
+
         if cmd == "quit":
             self._stop_event.set()
+
         elif cmd.startswith("mode:"):
             new_mode = cmd.split(":", 1)[1]
             renderer.mode = new_mode
-            self._config.mode = new_mode
-            self._config.save()
+            cfg.mode = new_mode
+            cfg.save()
+
         elif cmd.startswith("brightness:"):
             try:
                 value = int(cmd.split(":", 1)[1])
+                value = max(0, min(255, value))
                 renderer.brightness = value
                 driver.set_brightness(value)
-                self._config.brightness = value
-                self._config.save()
+                cfg.brightness = value
+                cfg.save()
             except ValueError:
-                log.warning("Invalid brightness value in command: %s", cmd)
+                log.warning("Invalid brightness value: %s", cmd)
+
+        elif cmd.startswith("toggle_stat:"):
+            key = cmd.split(":", 1)[1]
+            cfg.toggle_stat(key)
+            renderer.bar_slots = list(cfg.bar_slots)
+            cfg.save()
+            log.info("Bar slots: %s", cfg.bar_slots)
+
+        elif cmd.startswith("slots:"):
+            raw = cmd.split(":", 1)[1]
+            from .config import ALL_STAT_KEYS
+            new_slots = [k for k in raw.split(",") if k in ALL_STAT_KEYS]
+            if new_slots:
+                cfg.bar_slots = new_slots
+                renderer.bar_slots = new_slots
+                cfg.save()
+
+        elif cmd.startswith("link_brightness:"):
+            enabled = cmd.split(":", 1)[1] == "1"
+            cfg.link_screen_brightness = enabled
+            if not enabled:
+                # Restore configured brightness
+                renderer.brightness = cfg.brightness
+                driver.set_brightness(cfg.brightness)
+            cfg.save()
+
         elif cmd == "sleep":
             driver.sleep(True)
+
         elif cmd == "wake":
             driver.sleep(False)
+
         elif cmd == "reload_config":
-            self._config.load()
-            renderer.mode = self._config.mode
-            renderer.brightness = self._config.brightness
+            cfg.load()
+            renderer.mode = cfg.mode
+            renderer.brightness = cfg.brightness
+            renderer.bar_slots = list(cfg.bar_slots)
+
         else:
             log.warning("Unknown command: %s", cmd)

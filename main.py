@@ -80,7 +80,7 @@ def main() -> None:
         except KeyboardInterrupt:
             on_quit()
     else:
-        tray = TrayIcon(cmd_queue=cmd_q, on_quit=on_quit)
+        tray = TrayIcon(cmd_queue=cmd_q, config=config, on_quit=on_quit)
         tray.run()  # blocks on main thread
 
 
