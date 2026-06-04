@@ -14,10 +14,14 @@ Valid stat keys:
   "disk"       – Disk I/O activity % (busy time, like Task Manager)
   "disk_read"  – Disk read throughput MB/s
   "disk_write" – Disk write throughput MB/s
-  "net_rx"   – Network receive Mbit/s
-  "net_tx"   – Network transmit Mbit/s
-  "cpu_temp" – CPU package temperature °C
-  "gpu_temp" – GPU temperature °C
+  "net_rx"     – Network receive Mbit/s
+  "net_tx"     – Network transmit Mbit/s
+
+  Temperature sensors (require LibreHardwareMonitor or OHM running):
+  "cpu_temp"   – CPU/APU die temperature (F75303_CPU, most accurate)
+  "temp_ddr"   – DDR memory temperature (F75303_DDR)
+  "temp_local" – Local/ambient temperature (F75303_Local)
+  "gpu_temp"   – GPU temperature (dGPU AMB; zero if not installed)
 """
 
 from __future__ import annotations
@@ -38,8 +42,12 @@ ALL_STAT_KEYS: list[str] = [
     "cpu", "ram", "gpu", "gpu_vram",
     "disk", "disk_read", "disk_write",
     "net_rx", "net_tx",
-    "cpu_temp", "gpu_temp",
+    # Temperature sensors (hardware monitor required)
+    "cpu_temp", "temp_ddr", "temp_local", "gpu_temp",
 ]
+
+# Keys that belong to the "Temperatures" group in the tray slot submenu
+TEMP_STAT_KEYS: list[str] = ["cpu_temp", "temp_ddr", "temp_local", "gpu_temp"]
 
 # Human-readable labels for tray menus
 STAT_LABELS: dict[str, str] = {
@@ -50,17 +58,19 @@ STAT_LABELS: dict[str, str] = {
     "disk":       "Disk activity %",
     "disk_read":  "Disk read MB/s",
     "disk_write": "Disk write MB/s",
-    "net_rx":     "Net ↓ Mbit/s",
-    "net_tx":     "Net ↑ Mbit/s",
-    "cpu_temp":   "CPU Temp °C",
-    "gpu_temp":   "GPU Temp °C",
+    "net_rx":     "Net down Mbit/s",
+    "net_tx":     "Net up Mbit/s",
+    "cpu_temp":   "CPU temp (APU)",
+    "temp_ddr":   "DDR temp",
+    "temp_local": "Local temp",
+    "gpu_temp":   "GPU temp",
 }
 
-# Default 9 slots — disk_read and disk_write are available but not shown
-# by default (user can assign them to any slot via the tray menu).
+# Default 9 slots.
+# disk_read/disk_write/temp_local/gpu_temp available but opt-in via tray.
 _DEFAULT_SLOTS: list[Optional[str]] = [
     "cpu", "ram", "gpu", "gpu_vram", "disk",
-    "net_rx", "net_tx", "cpu_temp", "gpu_temp",
+    "net_rx", "net_tx", "cpu_temp", "temp_ddr",
 ]
 
 _DEFAULTS: dict[str, Any] = {

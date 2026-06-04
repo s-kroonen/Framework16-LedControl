@@ -160,16 +160,10 @@ class ServiceLoop:
                     # avoids redundant renderer updates and log spam.
                     if cfg.link_screen_brightness:
                         screen_pct = get_screen_brightness()
-                        log.debug(
-                            "Screen brightness read: %s%%  |  "
-                            "current matrix brightness: %d  |  ceiling: %d",
-                            screen_pct, renderer.brightness, cfg.brightness,
-                        )
                         if screen_pct is not None and screen_pct != last_screen_pct:
                             effective = max(5, int(screen_pct / 100.0 * cfg.brightness))
                             log.info(
-                                "Screen brightness changed: %d%% → "
-                                "matrix brightness %d (ceiling %d)",
+                                "Screen brightness: %d%% -> matrix %d (ceiling %d)",
                                 screen_pct, effective, cfg.brightness,
                             )
                             renderer.brightness = effective

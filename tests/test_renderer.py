@@ -3,6 +3,7 @@
 import pytest
 from led_control.renderer import (
     COLS, ROWS,
+    RollingMax,
     render_bars, render_cpu_cores, render_breathe, render_clock,
     Renderer, MODES,
 )
@@ -14,11 +15,13 @@ def _dummy_stats(**kwargs) -> SystemStats:
     defaults = dict(
         cpu_percent=50.0, cpu_cores=[50.0] * 4,
         ram_percent=40.0, ram_used_gb=6.4, ram_total_gb=16.0,
-        disk_percent=60.0,       # I/O activity %
+        disk_percent=60.0,
         disk_read_mbps=50.0,
         disk_write_mbps=20.0,
         gpu_percent=30.0, gpu_vram_percent=20.0, gpu_temp_c=55.0,
         cpu_temp_c=65.0,
+        temp_ddr_c=45.0,
+        temp_local_c=38.0,
         net_sent_mbps=1.0, net_recv_mbps=5.0,
     )
     defaults.update(kwargs)
@@ -33,8 +36,52 @@ def _validate_frame(frame):
             assert 0 <= v <= 255, f"Brightness {v} out of range"
 
 
-# Default slot list: all 9 stats
-_ALL_SLOTS = list(ALL_STAT_KEYS)   # 9 items
+# ---------------------------------------------------------------------------
+# RollingMax
+# ---------------------------------------------------------------------------
+
+class TestRollingMax:
+    def test_peak_jumps_immediately(self):
+        r = RollingMax(floor=1.0)
+        r.update(10.0)
+        assert r.ceiling() >= 10.0
+
+    def test_floor_respected(self):
+        r = RollingMax(floor=5.0)
+        assert r.ceiling() >= 5.0
+        r.update(0.0)
+        assert r.ceiling() >= 5.0
+
+    def test_decays_toward_floor(self):
+        import time as _time
+        r = RollingMax(floor=1.0, decay=0.5)   # very fast decay for test
+        r.update(100.0)
+        # Force a large dt by monkey-patching _last
+        r._last = _time.monotonic() - 10.0     # pretend 10 s have passed
+        val_after = r.update(0.0)
+        assert val_after < 100.0, "max should have decayed"
+
+    def test_headroom_applied(self):
+        r = RollingMax(floor=1.0)
+        r.update(50.0)
+        assert r.ceiling(headroom=1.2) > 50.0
+
+    def test_dynamic_scaling_in_renderer(self):
+        """Net/disk bars use rolling max so at peak they fill to ~100%."""
+        stats = _dummy_stats(net_recv_mbps=100.0)
+        rend = Renderer(mode="bars", brightness=255,
+                        bar_slots=["net_rx"] + [None] * 8)
+        # Prime the roller with the same value several times
+        for _ in range(5):
+            rend.render(stats)
+        frame = rend.render(stats)
+        _validate_frame(frame)
+        # With rolling max ≈ 100, bar should be near full
+        assert frame[0][ROWS - 1] > 0
+
+
+# Default slot list
+_ALL_SLOTS = list(ALL_STAT_KEYS)
 # One stat, rest empty
 _SINGLE_CPU = ["cpu"] + [None] * 8
 
@@ -63,7 +110,7 @@ class TestRenderBars:
             cpu_percent=0, ram_percent=0, gpu_percent=0, gpu_vram_percent=0,
             disk_percent=0, disk_read_mbps=0, disk_write_mbps=0,
             net_sent_mbps=0, net_recv_mbps=0,
-            cpu_temp_c=0, gpu_temp_c=0,
+            cpu_temp_c=0, gpu_temp_c=0, temp_ddr_c=0, temp_local_c=0,
         )
         frame = render_bars(stats, _ALL_SLOTS)
         assert all(v == 0 for col in frame for v in col)
@@ -119,6 +166,16 @@ class TestRenderBars:
         for key in ALL_STAT_KEYS:
             slots = [key] + [None] * 8
             _validate_frame(render_bars(stats, slots))
+
+    def test_temp_ddr_bar(self):
+        stats = _dummy_stats(temp_ddr_c=80)
+        frame = render_bars(stats, ["temp_ddr"] + [None] * 8)
+        assert frame[0][ROWS - 1] > 0
+
+    def test_temp_local_bar(self):
+        stats = _dummy_stats(temp_local_c=50)
+        frame = render_bars(stats, ["temp_local"] + [None] * 8)
+        assert frame[0][ROWS - 1] > 0
 
 
 # ---------------------------------------------------------------------------

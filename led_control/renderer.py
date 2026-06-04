@@ -72,10 +72,8 @@ _FONT_4X7: dict[str, list[int]] = {
     "9": _glyph([".##.", "#..#", "#..#", ".###", "...#", "...#", ".##."]),
 }
 
-# Ceiling values for rate-mapped metrics
-_TEMP_MAX = 100.0        # °C
-_NET_MAX_MBPS = 100.0    # Mbit/s network
-_DISK_MAX_MBPS = 500.0   # MB/s disk throughput (covers SATA SSD; NVMe saturates sooner)
+# Fixed ceiling for temperature bars (°C → 100 %)
+_TEMP_MAX = 100.0
 
 
 # ---------------------------------------------------------------------------
@@ -102,41 +100,89 @@ def _temp_bar_column(temp_c: float) -> list[int]:
     return _bar_column(pct, brightness)
 
 
-def _net_bar_column(mbps: float) -> list[int]:
-    pct = min(100.0, mbps / _NET_MAX_MBPS * 100.0)
+# ---------------------------------------------------------------------------
+# Rolling maximum tracker — used for dynamic scaling of rate metrics
+# ---------------------------------------------------------------------------
+
+class RollingMax:
+    """
+    Tracks a smoothly-decaying peak value.
+
+    When a new observation exceeds the current max it jumps immediately.
+    Otherwise the max decays toward `floor` by `decay` fraction per second
+    (default 1.5 % / s → half-life ≈ 45 s).  This means a burst of disk or
+    network activity raises the bar ceiling quickly, then the ceiling slowly
+    retreats to the observed minimum once traffic dies down — bars always
+    use most of their vertical range.
+    """
+
+    def __init__(self, floor: float = 1.0, decay: float = 0.015) -> None:
+        self._value  = floor
+        self._floor  = floor
+        self._decay  = decay          # fraction lost per second
+        self._last   = time.monotonic()
+
+    def update(self, value: float) -> float:
+        now = time.monotonic()
+        dt  = min(now - self._last, 10.0)   # cap gap (e.g. after sleep)
+        self._last = now
+        self._value = max(self._floor, self._value * ((1.0 - self._decay) ** dt))
+        if value > self._value:
+            self._value = value
+        return self._value
+
+    def ceiling(self, headroom: float = 1.1) -> float:
+        """Current peak × headroom — use as the bar's 100 % point."""
+        return max(self._floor, self._value * headroom)
+
+
+def _rate_bar_column(value: float, ceiling: float) -> list[int]:
+    """Bar for a rate metric scaled against a dynamic ceiling."""
+    pct = min(100.0, value / max(ceiling, 1e-9) * 100.0)
     return _bar_column(pct, 180)
 
 
-def _disk_rate_bar_column(mbps: float) -> list[int]:
-    """Disk read or write throughput bar (MB/s, ceiling _DISK_MAX_MBPS)."""
-    pct = min(100.0, mbps / _DISK_MAX_MBPS * 100.0)
-    return _bar_column(pct, 180)
+def _stat_to_column(
+    key: str,
+    stats: SystemStats,
+    rolls: dict[str, RollingMax] | None = None,
+) -> list[int]:
+    """
+    Render a stat key to a 34-row brightness column.
+    Pass `rolls` (a dict of RollingMax per rate-key) for dynamic scaling.
+    """
+    def _rate(value: float, roll_key: str) -> list[int]:
+        if rolls and roll_key in rolls:
+            return _rate_bar_column(value, rolls[roll_key].ceiling())
+        return _bar_column(min(100.0, value), 180)
 
-
-def _stat_to_column(key: str, stats: SystemStats) -> list[int]:
-    """Render a stat key to a 34-row brightness column."""
-    dispatch = {
-        "cpu":        lambda: _bar_column(stats.cpu_percent),
-        "ram":        lambda: _bar_column(stats.ram_percent),
-        "gpu":        lambda: _bar_column(stats.gpu_percent),
-        "gpu_vram":   lambda: _bar_column(stats.gpu_vram_percent),
-        "disk":       lambda: _bar_column(stats.disk_percent),      # I/O activity %
-        "disk_read":  lambda: _disk_rate_bar_column(stats.disk_read_mbps),
-        "disk_write": lambda: _disk_rate_bar_column(stats.disk_write_mbps),
-        "net_rx":     lambda: _net_bar_column(stats.net_recv_mbps),
-        "net_tx":     lambda: _net_bar_column(stats.net_sent_mbps),
-        "cpu_temp":   lambda: _temp_bar_column(stats.cpu_temp_c),
-        "gpu_temp":   lambda: _temp_bar_column(stats.gpu_temp_c),
+    dispatch: dict[str, list[int]] = {
+        "cpu":        _bar_column(stats.cpu_percent),
+        "ram":        _bar_column(stats.ram_percent),
+        "gpu":        _bar_column(stats.gpu_percent),
+        "gpu_vram":   _bar_column(stats.gpu_vram_percent),
+        "disk":       _bar_column(stats.disk_percent),
+        "disk_read":  _rate(stats.disk_read_mbps,  "disk_read"),
+        "disk_write": _rate(stats.disk_write_mbps, "disk_write"),
+        "net_rx":     _rate(stats.net_recv_mbps,   "net_rx"),
+        "net_tx":     _rate(stats.net_sent_mbps,   "net_tx"),
+        "cpu_temp":   _temp_bar_column(stats.cpu_temp_c),
+        "temp_ddr":   _temp_bar_column(stats.temp_ddr_c),
+        "temp_local": _temp_bar_column(stats.temp_local_c),
+        "gpu_temp":   _temp_bar_column(stats.gpu_temp_c),
     }
-    fn = dispatch.get(key)
-    return fn() if fn else [0] * ROWS
+    return dispatch.get(key, [0] * ROWS)
 
 
 # ---------------------------------------------------------------------------
 # Render functions
 # ---------------------------------------------------------------------------
 
-def render_bars(stats: SystemStats, slots: list[Optional[str]]) -> Frame:
+def render_bars(
+    stats: SystemStats,
+    slots: list[Optional[str]],
+    rolls: dict[str, RollingMax] | None = None,
+) -> Frame:
     """
     Render 9 bar-graph columns from the slot assignment list.
     slots[i] is the stat key for column i, or None for a dark column.
@@ -145,7 +191,7 @@ def render_bars(stats: SystemStats, slots: list[Optional[str]]) -> Frame:
     frame = _empty_frame()
     for col, key in enumerate(slots[:COLS]):
         if key is not None:
-            frame[col] = _stat_to_column(key, stats)
+            frame[col] = _stat_to_column(key, stats, rolls)
     return frame
 
 
@@ -235,26 +281,38 @@ class Renderer:
             raise ValueError(f"Unknown mode '{mode}'. Choose from {MODES}")
         self.mode = mode
         self.brightness = brightness
-        from .config import ALL_STAT_KEYS, NUM_SLOTS
-        if bar_slots is not None:
-            self.bar_slots: list[Optional[str]] = bar_slots
-        else:
-            # Default: all stats in canonical order
-            self.bar_slots = list(ALL_STAT_KEYS)
+        from .config import ALL_STAT_KEYS
+        self.bar_slots: list[Optional[str]] = (
+            bar_slots if bar_slots is not None else list(ALL_STAT_KEYS)
+        )
+        # One rolling-max tracker per rate-based metric.
+        # Each updates on every tick so the ceiling adapts to recent peaks.
+        self._rolls: dict[str, RollingMax] = {
+            "net_rx":     RollingMax(floor=0.5),   # Mbit/s
+            "net_tx":     RollingMax(floor=0.5),
+            "disk_read":  RollingMax(floor=0.5),   # MB/s
+            "disk_write": RollingMax(floor=0.5),
+        }
+
+    def _update_rolls(self, stats: SystemStats) -> None:
+        self._rolls["net_rx"].update(stats.net_recv_mbps)
+        self._rolls["net_tx"].update(stats.net_sent_mbps)
+        self._rolls["disk_read"].update(stats.disk_read_mbps)
+        self._rolls["disk_write"].update(stats.disk_write_mbps)
 
     def render(self, stats: SystemStats) -> Frame:
+        self._update_rolls(stats)
+
         if self.mode == "bars":
-            frame = render_bars(stats, self.bar_slots)
+            frame = render_bars(stats, self.bar_slots, self._rolls)
         elif self.mode == "cpu_cores":
             frame = render_cpu_cores(stats)
         elif self.mode == "clock":
-            # Clock uses brightness directly; skip scaling below
             return render_clock(self.brightness)
         elif self.mode == "breathe":
             return render_breathe()
         else:
             frame = _empty_frame()
 
-        # Apply global brightness scaling
         scale = self.brightness / 255.0
         return [[int(v * scale) for v in col] for col in frame]

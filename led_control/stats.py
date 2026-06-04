@@ -1,20 +1,24 @@
 """
 System metric collectors.
 
-All public functions return values in the range 0.0–100.0 (percentage)
-unless otherwise documented.  GPU support falls back gracefully when
-no supported GPU is present.
+Temperature sensors
+───────────────────
+Temperature reading requires LibreHardwareMonitor or Open Hardware Monitor
+to be running.  The service connects to their WMI namespace at startup and
+maps sensor names to stat keys:
+
+  cpu_temp   ← F75303_CPU  (APU die, most accurate)
+  temp_ddr   ← F75303_DDR  (memory temperature)
+  temp_local ← F75303_Local (ambient near F75303 chip)
+  gpu_temp   ← dGPU AMB / GPU Core (zero if no dGPU installed)
+
+Without a hardware monitor running, temperature stats return 0.
 
 Disk metrics
 ────────────
-  disk_percent    I/O activity % (0–100).  Calculated from the
-                  read_time + write_time deltas reported by
-                  psutil.disk_io_counters() over each tick interval.
-                  This matches what Windows Task Manager shows in the
-                  "Disk" column — how busy the disk was, not how full it is.
-
-  disk_read_mbps  Read throughput in MB/s since last tick.
-  disk_write_mbps Write throughput in MB/s since last tick.
+  disk_percent    I/O busy % (read_time + write_time delta / elapsed).
+  disk_read_mbps  Read throughput MB/s.
+  disk_write_mbps Write throughput MB/s.
 """
 
 from __future__ import annotations
@@ -22,13 +26,12 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import psutil
 
 log = logging.getLogger(__name__)
 
-# Optional GPU support
 try:
     import GPUtil  # type: ignore
     _GPUTIL_AVAILABLE = True
@@ -42,186 +45,247 @@ except Exception:
     _WMI_AVAILABLE = False
 
 
-# Cached WMI brightness connection.
-# Initialised lazily on the first call that succeeds; stays None if the
-# platform does not support WMI brightness or COM is not yet initialised
-# on this thread.  Call init_wmi_brightness() once per thread before use.
+# ---------------------------------------------------------------------------
+# Screen brightness  (WMI root\wmi — must call init_wmi_brightness() first)
+# ---------------------------------------------------------------------------
+
 _brightness_wmi = None
 
 
 def init_wmi_brightness() -> None:
     """
-    Initialise the per-thread WMI brightness connection.
-
-    MUST be called once at the start of whichever thread will call
-    get_screen_brightness().  WMI uses COM under the hood; Python daemon
-    threads do not initialise COM automatically, which causes a silent
-    x_wmi_uninitialised_thread error.
-
-    Requires pythoncom (part of pywin32).
+    Create the per-thread WMI brightness connection.
+    Call once at thread start after pythoncom.CoInitialize().
     """
     global _brightness_wmi
     if not _WMI_AVAILABLE:
         return
     try:
-        import pythoncom
-        pythoncom.CoInitialize()
         _brightness_wmi = wmi.WMI(namespace="root\\wmi")
-        log.debug("WMI brightness connection initialised on thread %s",
-                  __import__("threading").current_thread().name)
+        log.debug("WMI brightness connection ready")
     except Exception as exc:
         log.warning("init_wmi_brightness failed: %s: %s", type(exc).__name__, exc)
         _brightness_wmi = None
 
 
 def get_screen_brightness() -> Optional[int]:
-    """
-    Return the current Windows display brightness (0–100), or None.
-
-    Call init_wmi_brightness() once on the calling thread before using
-    this function — WMI/COM requires per-thread initialisation.
-    """
+    """Return current display brightness 0–100, or None."""
     if _brightness_wmi is None:
         return None
     try:
         monitors = _brightness_wmi.WmiMonitorBrightness()
         if monitors:
             return int(monitors[0].CurrentBrightness)
-        log.debug("WmiMonitorBrightness returned no monitors")
     except Exception as exc:
-        log.debug("get_screen_brightness error: %s: %s", type(exc).__name__, exc)
+        log.debug("get_screen_brightness: %s", exc)
     return None
 
 
+# ---------------------------------------------------------------------------
+# Hardware monitor temperature sensors
+# ---------------------------------------------------------------------------
+
+class TempSensorReader:
+    """
+    Reads named temperature sensors from LibreHardwareMonitor or
+    Open Hardware Monitor via their WMI namespace.
+
+    Must call init() on the service thread after CoInitialize().
+
+    Sensor-to-stat-key mapping (first matching name wins):
+      cpu_temp   → F75303_CPU, CPU Package, CPU Tdie, Tctl/Tdie
+      temp_ddr   → F75303_DDR, T_MEM, DDR
+      temp_local → F75303_Local, Local, Ambient
+      gpu_temp   → dGPU AMB, GPU Core, GPU
+    """
+
+    _NAMESPACES = [
+        "root\\LibreHardwareMonitor",
+        "root\\OpenHardwareMonitor",
+    ]
+
+    # Ordered candidate names for each stat key
+    _CANDIDATES: Dict[str, List[str]] = {
+        "cpu_temp":   ["F75303_CPU", "CPU Package", "CPU Tdie", "Tctl/Tdie"],
+        "temp_ddr":   ["F75303_DDR", "T_MEM", "DDR"],
+        "temp_local": ["F75303_Local", "Local", "Ambient"],
+        "gpu_temp":   ["dGPU AMB", "GPU Core", "GPU"],
+    }
+
+    def __init__(self) -> None:
+        self._wmi: Any = None
+        # stat_key -> exact sensor name in WMI
+        self._key_to_sensor: Dict[str, str] = {}
+
+    def init(self) -> None:
+        """Connect to hardware monitor WMI namespace. Call on service thread."""
+        if not _WMI_AVAILABLE:
+            log.debug("TempSensorReader: wmi module not available")
+            return
+
+        for ns in self._NAMESPACES:
+            try:
+                w = wmi.WMI(namespace=ns)
+                available: Dict[str, float] = {}
+                for s in w.Sensor():
+                    if s.SensorType == "Temperature" and s.Value is not None:
+                        available[s.Name] = float(s.Value)
+
+                if not available:
+                    log.debug("%s: no temperature sensors found", ns)
+                    continue
+
+                # Build key → sensor-name map
+                mapping: Dict[str, str] = {}
+                for key, candidates in self._CANDIDATES.items():
+                    for name in candidates:
+                        if name in available:
+                            mapping[key] = name
+                            break
+
+                if mapping:
+                    self._wmi = w
+                    self._key_to_sensor = mapping
+                    log.info(
+                        "Hardware temperature sensors: namespace=%s  mapped=%s  "
+                        "available=%s",
+                        ns,
+                        {k: v for k, v in mapping.items()},
+                        sorted(available.keys()),
+                    )
+                    return
+                else:
+                    log.debug("%s: sensors present but none matched our keys", ns)
+
+            except Exception as exc:
+                log.debug("TempSensorReader: cannot connect to %s: %s", ns, exc)
+
+        log.info(
+            "No hardware monitor WMI namespace available.  "
+            "Install LibreHardwareMonitor or Open Hardware Monitor and "
+            "run it once to expose sensors."
+        )
+
+    def read(self) -> Dict[str, float]:
+        """Return {stat_key: temp_celsius} for all mapped sensors."""
+        if self._wmi is None:
+            return {}
+        try:
+            live: Dict[str, float] = {}
+            for s in self._wmi.Sensor():
+                if s.SensorType == "Temperature" and s.Value is not None:
+                    live[s.Name] = float(s.Value)
+            return {
+                key: live[name]
+                for key, name in self._key_to_sensor.items()
+                if name in live
+            }
+        except Exception as exc:
+            log.debug("TempSensorReader.read error: %s", exc)
+            return {}
+
+    @property
+    def mapped_keys(self) -> List[str]:
+        return list(self._key_to_sensor.keys())
+
+
+# ---------------------------------------------------------------------------
+# System stats dataclass
+# ---------------------------------------------------------------------------
+
 @dataclass
 class SystemStats:
-    """Snapshot of system metrics at a point in time."""
-    cpu_percent: float = 0.0          # overall CPU %
+    """Snapshot of all system metrics."""
+    cpu_percent: float = 0.0
     cpu_cores: List[float] = field(default_factory=list)
     ram_percent: float = 0.0
     ram_used_gb: float = 0.0
     ram_total_gb: float = 0.0
-    disk_percent: float = 0.0         # disk I/O activity % (NOT space used)
-    disk_read_mbps: float = 0.0       # disk read throughput MB/s
-    disk_write_mbps: float = 0.0      # disk write throughput MB/s
+    disk_percent: float = 0.0       # I/O busy %
+    disk_read_mbps: float = 0.0
+    disk_write_mbps: float = 0.0
     gpu_percent: float = 0.0
     gpu_vram_percent: float = 0.0
-    gpu_temp_c: float = 0.0
-    cpu_temp_c: float = 0.0
-    net_sent_mbps: float = 0.0        # TX Mbit/s
-    net_recv_mbps: float = 0.0        # RX Mbit/s
+    gpu_temp_c: float = 0.0         # dGPU AMB or GPU Core
+    cpu_temp_c: float = 0.0         # F75303_CPU / APU die
+    temp_ddr_c: float = 0.0         # F75303_DDR / memory
+    temp_local_c: float = 0.0       # F75303_Local / ambient
+    net_sent_mbps: float = 0.0
+    net_recv_mbps: float = 0.0
 
+
+# ---------------------------------------------------------------------------
+# Collector
+# ---------------------------------------------------------------------------
 
 class StatsCollector:
-    """Collects system statistics.  Call .collect() on each tick."""
+    """Collects system statistics each tick.  Call .collect()."""
 
     def __init__(self) -> None:
-        # Seed CPU counters
+        # Seed CPU counters (first call always returns 0.0)
         psutil.cpu_percent(interval=None)
         psutil.cpu_percent(percpu=True, interval=None)
 
         now = time.monotonic()
 
-        # Seed network counters
+        # Network baseline
         net = psutil.net_io_counters()
         self._prev_net_sent = net.bytes_sent
         self._prev_net_recv = net.bytes_recv
 
-        # Seed disk counters
+        # Disk baseline
         try:
             disk = psutil.disk_io_counters()
-            self._prev_disk_read_bytes = disk.read_bytes
+            self._prev_disk_read_bytes  = disk.read_bytes
             self._prev_disk_write_bytes = disk.write_bytes
-            self._prev_disk_read_ms = disk.read_time
-            self._prev_disk_write_ms = disk.write_time
+            self._prev_disk_read_ms     = disk.read_time
+            self._prev_disk_write_ms    = disk.write_time
             self._disk_available = True
         except Exception:
-            self._prev_disk_read_bytes = 0
+            self._prev_disk_read_bytes  = 0
             self._prev_disk_write_bytes = 0
-            self._prev_disk_read_ms = 0
-            self._prev_disk_write_ms = 0
+            self._prev_disk_read_ms     = 0
+            self._prev_disk_write_ms    = 0
             self._disk_available = False
 
         self._prev_io_ts = now
 
+        # Hardware temperature sensors (LibreHardwareMonitor / OHM)
+        self._temp_reader = TempSensorReader()
+        self._temp_reader.init()
+
     # ------------------------------------------------------------------
-    # CPU
+    # Private helpers
     # ------------------------------------------------------------------
 
     def _cpu(self) -> tuple[float, List[float]]:
-        overall = psutil.cpu_percent(interval=None)
-        cores = psutil.cpu_percent(percpu=True, interval=None)
-        return overall, cores
-
-    def _cpu_temp(self) -> float:
-        try:
-            temps = psutil.sensors_temperatures()
-            for key in ("coretemp", "k10temp", "cpu_thermal", "acpitz"):
-                if key in temps:
-                    entries = [
-                        e for e in temps[key]
-                        if "package" in e.label.lower() or e.label == ""
-                    ]
-                    if entries:
-                        return entries[0].current
-        except (AttributeError, Exception):
-            pass
-        return 0.0
-
-    # ------------------------------------------------------------------
-    # RAM
-    # ------------------------------------------------------------------
+        return psutil.cpu_percent(interval=None), \
+               psutil.cpu_percent(percpu=True, interval=None)
 
     def _ram(self) -> tuple[float, float, float]:
         vm = psutil.virtual_memory()
         return vm.percent, vm.used / 1e9, vm.total / 1e9
 
-    # ------------------------------------------------------------------
-    # Disk  (I/O activity + throughput)
-    # ------------------------------------------------------------------
-
     def _disk(self, dt: float) -> tuple[float, float, float]:
-        """
-        Returns (activity_pct, read_mbps, write_mbps).
-
-        activity_pct — fraction of the tick interval the disk was busy
-                       (read_time + write_time delta) / (dt × 1000 ms), × 100.
-                       Capped at 100 %.  Mirrors Task Manager's Disk column.
-
-        read_mbps / write_mbps — throughput in MB/s (not Mbit/s; disk
-                       transfer rates are conventionally in MB/s).
-        """
+        """Returns (busy_pct, read_mbps, write_mbps)."""
         if not self._disk_available or dt <= 0:
             return 0.0, 0.0, 0.0
         try:
-            disk = psutil.disk_io_counters()
-
-            # Throughput
-            read_mb = (disk.read_bytes - self._prev_disk_read_bytes) / 1e6 / dt
-            write_mb = (disk.write_bytes - self._prev_disk_write_bytes) / 1e6 / dt
-
-            # Activity %: time spent doing I/O vs elapsed time
-            dt_ms = dt * 1000.0
-            busy_ms = (
-                (disk.read_time - self._prev_disk_read_ms)
-                + (disk.write_time - self._prev_disk_write_ms)
-            )
+            d = psutil.disk_io_counters()
+            read_mb  = (d.read_bytes  - self._prev_disk_read_bytes)  / 1e6 / dt
+            write_mb = (d.write_bytes - self._prev_disk_write_bytes) / 1e6 / dt
+            dt_ms    = dt * 1000.0
+            busy_ms  = ((d.read_time  - self._prev_disk_read_ms)
+                      + (d.write_time - self._prev_disk_write_ms))
             activity = min(100.0, max(0.0, busy_ms / dt_ms * 100.0))
-
-            # Update counters
-            self._prev_disk_read_bytes = disk.read_bytes
-            self._prev_disk_write_bytes = disk.write_bytes
-            self._prev_disk_read_ms = disk.read_time
-            self._prev_disk_write_ms = disk.write_time
-
+            self._prev_disk_read_bytes  = d.read_bytes
+            self._prev_disk_write_bytes = d.write_bytes
+            self._prev_disk_read_ms     = d.read_time
+            self._prev_disk_write_ms    = d.write_time
             return activity, max(0.0, read_mb), max(0.0, write_mb)
         except Exception as exc:
-            log.debug("disk_io_counters error: %s", exc)
+            log.debug("disk_io_counters: %s", exc)
             return 0.0, 0.0, 0.0
-
-    # ------------------------------------------------------------------
-    # GPU
-    # ------------------------------------------------------------------
 
     def _gpu(self) -> tuple[float, float, float]:
         if _GPUTIL_AVAILABLE:
@@ -231,21 +295,15 @@ class StatsCollector:
                     g = gpus[0]
                     load = (g.load or 0) * 100
                     vram = (g.memoryUsed / g.memoryTotal * 100) if g.memoryTotal else 0
-                    temp = g.temperature or 0
-                    return load, vram, temp
+                    return load, vram, g.temperature or 0
             except Exception:
                 pass
         return 0.0, 0.0, 0.0
 
-    # ------------------------------------------------------------------
-    # Network
-    # ------------------------------------------------------------------
-
     def _net(self, dt: float) -> tuple[float, float]:
-        """Returns (sent_mbps, recv_mbps) in Mbit/s."""
         if dt <= 0:
             return 0.0, 0.0
-        net = psutil.net_io_counters()
+        net  = psutil.net_io_counters()
         sent = (net.bytes_sent - self._prev_net_sent) * 8 / 1e6 / dt
         recv = (net.bytes_recv - self._prev_net_recv) * 8 / 1e6 / dt
         self._prev_net_sent = net.bytes_sent
@@ -253,34 +311,40 @@ class StatsCollector:
         return max(0.0, sent), max(0.0, recv)
 
     # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
 
     def collect(self) -> SystemStats:
-        """Collect and return a fresh SystemStats snapshot."""
         now = time.monotonic()
-        dt = now - self._prev_io_ts
+        dt  = max(0.001, now - self._prev_io_ts)
         self._prev_io_ts = now
 
-        cpu, cores = self._cpu()
+        cpu, cores              = self._cpu()
         ram_pct, ram_used, ram_total = self._ram()
-        disk_act, disk_read, disk_write = self._disk(dt)
+        disk_act, disk_r, disk_w     = self._disk(dt)
         gpu_load, gpu_vram, gpu_temp = self._gpu()
-        sent, recv = self._net(dt)
+        sent, recv               = self._net(dt)
+
+        # Hardware monitor temperatures
+        temps = self._temp_reader.read()
+        cpu_temp   = temps.get("cpu_temp",   0.0)
+        temp_ddr   = temps.get("temp_ddr",   0.0)
+        temp_local = temps.get("temp_local", 0.0)
+        _gpu_temp  = temps.get("gpu_temp",   gpu_temp)  # prefer HW monitor
 
         return SystemStats(
-            cpu_percent=cpu,
-            cpu_cores=cores,
-            ram_percent=ram_pct,
-            ram_used_gb=ram_used,
-            ram_total_gb=ram_total,
-            disk_percent=disk_act,
-            disk_read_mbps=disk_read,
-            disk_write_mbps=disk_write,
-            gpu_percent=gpu_load,
-            gpu_vram_percent=gpu_vram,
-            gpu_temp_c=gpu_temp,
-            cpu_temp_c=self._cpu_temp(),
-            net_sent_mbps=sent,
-            net_recv_mbps=recv,
+            cpu_percent     = cpu,
+            cpu_cores       = cores,
+            ram_percent     = ram_pct,
+            ram_used_gb     = ram_used,
+            ram_total_gb    = ram_total,
+            disk_percent    = disk_act,
+            disk_read_mbps  = disk_r,
+            disk_write_mbps = disk_w,
+            gpu_percent     = gpu_load,
+            gpu_vram_percent= gpu_vram,
+            gpu_temp_c      = _gpu_temp,
+            cpu_temp_c      = cpu_temp,
+            temp_ddr_c      = temp_ddr,
+            temp_local_c    = temp_local,
+            net_sent_mbps   = sent,
+            net_recv_mbps   = recv,
         )

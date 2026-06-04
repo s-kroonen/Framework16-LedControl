@@ -43,7 +43,7 @@ except ImportError:
     pystray = None  # type: ignore
 
 from . import startup
-from .config import ALL_STAT_KEYS, STAT_LABELS, NUM_SLOTS, Config
+from .config import ALL_STAT_KEYS, STAT_LABELS, TEMP_STAT_KEYS, NUM_SLOTS, Config
 
 log = logging.getLogger(__name__)
 
@@ -100,24 +100,40 @@ class TrayIcon:
     # ------------------------------------------------------------------
 
     def _make_slot_submenu(self, slot_idx: int) -> "pystray.Menu":
+        # Non-temperature stat keys (shown flat at the top of the submenu)
+        _non_temp = [k for k in ALL_STAT_KEYS if k not in TEMP_STAT_KEYS]
+
         def items():
-            # Read current assignment fresh every time the submenu opens
             current = self._config.bar_slots[slot_idx]
 
+            # Empty option
             yield Item(
                 "Empty",
                 self._set_slot_cb(slot_idx, None),
                 checked=lambda item, c=current: c is None,
                 radio=True,
             )
-            for key in ALL_STAT_KEYS:
-                label = STAT_LABELS[key]
+
+            # Non-temperature stats (flat list)
+            for key in _non_temp:
                 yield Item(
-                    label,
+                    STAT_LABELS[key],
                     self._set_slot_cb(slot_idx, key),
                     checked=lambda item, k=key, c=current: c == k,
                     radio=True,
                 )
+
+            # Temperature sensors — nested submenu
+            def temp_items(c=current):
+                for key in TEMP_STAT_KEYS:
+                    yield Item(
+                        STAT_LABELS[key],
+                        self._set_slot_cb(slot_idx, key),
+                        checked=lambda item, k=key, cur=c: cur == k,
+                        radio=True,
+                    )
+
+            yield Item("Temperatures", pystray.Menu(temp_items))
 
         return pystray.Menu(items)
 
