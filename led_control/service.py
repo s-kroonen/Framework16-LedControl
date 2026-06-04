@@ -32,7 +32,7 @@ import time
 from .config import Config, ALL_STAT_KEYS
 from .led_driver import LedDriver
 from .renderer import Renderer
-from .stats import StatsCollector, get_screen_brightness
+from .stats import StatsCollector, get_screen_brightness, init_wmi_brightness
 
 log = logging.getLogger(__name__)
 
@@ -70,6 +70,19 @@ class ServiceLoop:
     # ------------------------------------------------------------------
 
     def _run(self) -> None:
+        # Initialise COM for this thread so WMI calls work.
+        # pythoncom is part of pywin32 and must be called once per thread.
+        try:
+            import pythoncom
+            pythoncom.CoInitialize()
+            _com_initialised = True
+        except Exception as exc:
+            log.debug("pythoncom.CoInitialize skipped: %s", exc)
+            _com_initialised = False
+
+        # Now safe to set up WMI brightness connection on this thread.
+        init_wmi_brightness()
+
         cfg = self._config
         driver = LedDriver(port=cfg.serial_port)
         driver.connect()
@@ -173,6 +186,14 @@ class ServiceLoop:
             driver.clear()
             driver.sleep(True)
         driver.disconnect()
+
+        if _com_initialised:
+            try:
+                import pythoncom
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
+
         log.info("Service loop exited cleanly")
 
     def _handle_command(

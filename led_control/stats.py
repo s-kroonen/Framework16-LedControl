@@ -42,20 +42,54 @@ except Exception:
     _WMI_AVAILABLE = False
 
 
+# Cached WMI brightness connection.
+# Initialised lazily on the first call that succeeds; stays None if the
+# platform does not support WMI brightness or COM is not yet initialised
+# on this thread.  Call init_wmi_brightness() once per thread before use.
+_brightness_wmi = None
+
+
+def init_wmi_brightness() -> None:
+    """
+    Initialise the per-thread WMI brightness connection.
+
+    MUST be called once at the start of whichever thread will call
+    get_screen_brightness().  WMI uses COM under the hood; Python daemon
+    threads do not initialise COM automatically, which causes a silent
+    x_wmi_uninitialised_thread error.
+
+    Requires pythoncom (part of pywin32).
+    """
+    global _brightness_wmi
+    if not _WMI_AVAILABLE:
+        return
+    try:
+        import pythoncom
+        pythoncom.CoInitialize()
+        _brightness_wmi = wmi.WMI(namespace="root\\wmi")
+        log.debug("WMI brightness connection initialised on thread %s",
+                  __import__("threading").current_thread().name)
+    except Exception as exc:
+        log.warning("init_wmi_brightness failed: %s: %s", type(exc).__name__, exc)
+        _brightness_wmi = None
+
+
 def get_screen_brightness() -> Optional[int]:
     """
-    Return the current Windows display brightness (0–100), or None if
-    unavailable (desktop PC / missing backlight driver / WMI not installed).
+    Return the current Windows display brightness (0–100), or None.
+
+    Call init_wmi_brightness() once on the calling thread before using
+    this function — WMI/COM requires per-thread initialisation.
     """
-    if not _WMI_AVAILABLE:
+    if _brightness_wmi is None:
         return None
     try:
-        w = wmi.WMI(namespace="root\\wmi")
-        monitors = w.WmiMonitorBrightness()
+        monitors = _brightness_wmi.WmiMonitorBrightness()
         if monitors:
             return int(monitors[0].CurrentBrightness)
-    except Exception:
-        pass
+        log.debug("WmiMonitorBrightness returned no monitors")
+    except Exception as exc:
+        log.debug("get_screen_brightness error: %s: %s", type(exc).__name__, exc)
     return None
 
 
