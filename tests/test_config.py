@@ -35,7 +35,11 @@ def test_defaults(tmp_path):
 def test_bar_slots_default_is_9_items(tmp_path):
     cfg = _cfg(tmp_path)
     assert len(cfg.bar_slots) == NUM_SLOTS
-    assert cfg.bar_slots == list(ALL_STAT_KEYS)
+    # Default slots are a curated 9 (ALL_STAT_KEYS has 11 — disk_read and
+    # disk_write are available but not shown by default)
+    assert "cpu" in cfg.bar_slots
+    assert "disk" in cfg.bar_slots
+    assert all(k in ALL_STAT_KEYS for k in cfg.bar_slots if k is not None)
 
 
 def test_save_and_reload(tmp_path):

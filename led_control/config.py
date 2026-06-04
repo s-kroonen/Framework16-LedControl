@@ -11,7 +11,9 @@ Valid stat keys:
   "ram"      – RAM %
   "gpu"      – GPU load %
   "gpu_vram" – GPU VRAM %
-  "disk"     – Disk usage %
+  "disk"       – Disk I/O activity % (busy time, like Task Manager)
+  "disk_read"  – Disk read throughput MB/s
+  "disk_write" – Disk write throughput MB/s
   "net_rx"   – Network receive Mbit/s
   "net_tx"   – Network transmit Mbit/s
   "cpu_temp" – CPU package temperature °C
@@ -33,25 +35,33 @@ NUM_SLOTS = 9   # matches physical matrix column count
 
 # Canonical ordered list of all stat keys
 ALL_STAT_KEYS: list[str] = [
-    "cpu", "ram", "gpu", "gpu_vram", "disk",
-    "net_rx", "net_tx", "cpu_temp", "gpu_temp",
+    "cpu", "ram", "gpu", "gpu_vram",
+    "disk", "disk_read", "disk_write",
+    "net_rx", "net_tx",
+    "cpu_temp", "gpu_temp",
 ]
 
 # Human-readable labels for tray menus
 STAT_LABELS: dict[str, str] = {
-    "cpu":      "CPU %",
-    "ram":      "RAM %",
-    "gpu":      "GPU load %",
-    "gpu_vram": "GPU VRAM %",
-    "disk":     "Disk %",
-    "net_rx":   "Net ↓ Mbit/s",
-    "net_tx":   "Net ↑ Mbit/s",
-    "cpu_temp": "CPU Temp °C",
-    "gpu_temp": "GPU Temp °C",
+    "cpu":        "CPU %",
+    "ram":        "RAM %",
+    "gpu":        "GPU load %",
+    "gpu_vram":   "GPU VRAM %",
+    "disk":       "Disk activity %",
+    "disk_read":  "Disk read MB/s",
+    "disk_write": "Disk write MB/s",
+    "net_rx":     "Net ↓ Mbit/s",
+    "net_tx":     "Net ↑ Mbit/s",
+    "cpu_temp":   "CPU Temp °C",
+    "gpu_temp":   "GPU Temp °C",
 }
 
-# Default slots: all 9 stats, one per column
-_DEFAULT_SLOTS: list[Optional[str]] = list(ALL_STAT_KEYS)  # exactly 9
+# Default 9 slots — disk_read and disk_write are available but not shown
+# by default (user can assign them to any slot via the tray menu).
+_DEFAULT_SLOTS: list[Optional[str]] = [
+    "cpu", "ram", "gpu", "gpu_vram", "disk",
+    "net_rx", "net_tx", "cpu_temp", "gpu_temp",
+]
 
 _DEFAULTS: dict[str, Any] = {
     "mode": "bars",

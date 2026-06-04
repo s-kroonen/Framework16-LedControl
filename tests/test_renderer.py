@@ -14,7 +14,9 @@ def _dummy_stats(**kwargs) -> SystemStats:
     defaults = dict(
         cpu_percent=50.0, cpu_cores=[50.0] * 4,
         ram_percent=40.0, ram_used_gb=6.4, ram_total_gb=16.0,
-        disk_percent=60.0,
+        disk_percent=60.0,       # I/O activity %
+        disk_read_mbps=50.0,
+        disk_write_mbps=20.0,
         gpu_percent=30.0, gpu_vram_percent=20.0, gpu_temp_c=55.0,
         cpu_temp_c=65.0,
         net_sent_mbps=1.0, net_recv_mbps=5.0,
@@ -59,7 +61,8 @@ class TestRenderBars:
     def test_zero_stats_is_dark(self):
         stats = _dummy_stats(
             cpu_percent=0, ram_percent=0, gpu_percent=0, gpu_vram_percent=0,
-            disk_percent=0, net_sent_mbps=0, net_recv_mbps=0,
+            disk_percent=0, disk_read_mbps=0, disk_write_mbps=0,
+            net_sent_mbps=0, net_recv_mbps=0,
             cpu_temp_c=0, gpu_temp_c=0,
         )
         frame = render_bars(stats, _ALL_SLOTS)
@@ -92,6 +95,24 @@ class TestRenderBars:
         slots = _ALL_SLOTS + ["cpu", "ram"]   # 11 items
         frame = render_bars(stats, slots)
         _validate_frame(frame)
+
+    def test_disk_activity_bar(self):
+        """disk_percent is I/O activity %; 100% should fully light its column."""
+        stats = _dummy_stats(disk_percent=100)
+        frame = render_bars(stats, ["disk"] + [None] * 8)
+        assert frame[0][ROWS - 1] > 0, "Full disk activity should light bottom row"
+        assert frame[0][0] > 0, "Full disk activity should light top row"
+
+    def test_disk_read_bar(self):
+        stats = _dummy_stats(disk_read_mbps=500)  # at ceiling → full bar
+        frame = render_bars(stats, ["disk_read"] + [None] * 8)
+        assert frame[0][ROWS - 1] > 0
+        assert frame[0][0] > 0
+
+    def test_disk_write_bar(self):
+        stats = _dummy_stats(disk_write_mbps=0)
+        frame = render_bars(stats, ["disk_write"] + [None] * 8)
+        assert all(v == 0 for v in frame[0])
 
     def test_all_stat_keys_render_without_error(self):
         stats = _dummy_stats()
@@ -186,7 +207,11 @@ class TestRenderer:
 
     def test_default_bar_slots_is_all_stats(self):
         r = Renderer(mode="bars")
+        # Default comes from ALL_STAT_KEYS; with 11 keys the list is 11 items
         assert r.bar_slots == list(ALL_STAT_KEYS)
+        assert "disk" in r.bar_slots
+        assert "disk_read" in r.bar_slots
+        assert "disk_write" in r.bar_slots
 
     def test_custom_bar_slots(self):
         slots = ["cpu", None, "ram"] + [None] * 6

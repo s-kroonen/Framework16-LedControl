@@ -72,9 +72,10 @@ _FONT_4X7: dict[str, list[int]] = {
     "9": _glyph([".##.", "#..#", "#..#", ".###", "...#", "...#", ".##."]),
 }
 
-# Ceiling values for percentage-mapped metrics
-_TEMP_MAX = 100.0       # °C
-_NET_MAX_MBPS = 100.0   # Mbit/s
+# Ceiling values for rate-mapped metrics
+_TEMP_MAX = 100.0        # °C
+_NET_MAX_MBPS = 100.0    # Mbit/s network
+_DISK_MAX_MBPS = 500.0   # MB/s disk throughput (covers SATA SSD; NVMe saturates sooner)
 
 
 # ---------------------------------------------------------------------------
@@ -106,18 +107,26 @@ def _net_bar_column(mbps: float) -> list[int]:
     return _bar_column(pct, 180)
 
 
+def _disk_rate_bar_column(mbps: float) -> list[int]:
+    """Disk read or write throughput bar (MB/s, ceiling _DISK_MAX_MBPS)."""
+    pct = min(100.0, mbps / _DISK_MAX_MBPS * 100.0)
+    return _bar_column(pct, 180)
+
+
 def _stat_to_column(key: str, stats: SystemStats) -> list[int]:
     """Render a stat key to a 34-row brightness column."""
     dispatch = {
-        "cpu":      lambda: _bar_column(stats.cpu_percent),
-        "ram":      lambda: _bar_column(stats.ram_percent),
-        "gpu":      lambda: _bar_column(stats.gpu_percent),
-        "gpu_vram": lambda: _bar_column(stats.gpu_vram_percent),
-        "disk":     lambda: _bar_column(stats.disk_percent),
-        "net_rx":   lambda: _net_bar_column(stats.net_recv_mbps),
-        "net_tx":   lambda: _net_bar_column(stats.net_sent_mbps),
-        "cpu_temp": lambda: _temp_bar_column(stats.cpu_temp_c),
-        "gpu_temp": lambda: _temp_bar_column(stats.gpu_temp_c),
+        "cpu":        lambda: _bar_column(stats.cpu_percent),
+        "ram":        lambda: _bar_column(stats.ram_percent),
+        "gpu":        lambda: _bar_column(stats.gpu_percent),
+        "gpu_vram":   lambda: _bar_column(stats.gpu_vram_percent),
+        "disk":       lambda: _bar_column(stats.disk_percent),      # I/O activity %
+        "disk_read":  lambda: _disk_rate_bar_column(stats.disk_read_mbps),
+        "disk_write": lambda: _disk_rate_bar_column(stats.disk_write_mbps),
+        "net_rx":     lambda: _net_bar_column(stats.net_recv_mbps),
+        "net_tx":     lambda: _net_bar_column(stats.net_sent_mbps),
+        "cpu_temp":   lambda: _temp_bar_column(stats.cpu_temp_c),
+        "gpu_temp":   lambda: _temp_bar_column(stats.gpu_temp_c),
     }
     fn = dispatch.get(key)
     return fn() if fn else [0] * ROWS
