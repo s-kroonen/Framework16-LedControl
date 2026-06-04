@@ -121,8 +121,8 @@ class LedDriver:
         try:
             self._serial.write(packet)
         except serial.SerialException as exc:
-            log.error("Write error: %s – attempting reconnect", exc)
-            self.reconnect()
+            log.warning("Write error: %s — disconnecting (service will retry)", exc)
+            self.disconnect()   # sets self._serial = None; connected → False
 
     # ------------------------------------------------------------------
     # Public commands

@@ -81,7 +81,19 @@ class ServiceLoop:
             bar_slots=list(cfg.bar_slots),
         )
 
-        driver.sleep(False)
+        if driver.connected:
+            driver.sleep(False)
+
+        # --- Reconnection state ---
+        _BACKOFF_INITIAL = 1.0    # seconds
+        _BACKOFF_MAX     = 60.0   # seconds
+        backoff          = _BACKOFF_INITIAL
+        next_reconnect_at = 0.0   # monotonic time; 0 = reconnect immediately
+
+        # --- Brightness-link state ---
+        # Track the last screen percentage we acted on so we only call
+        # renderer updates (and emit logs) when the value actually changes.
+        last_screen_pct: int | None = None
 
         last_tick = 0.0
 
@@ -91,32 +103,64 @@ class ServiceLoop:
                 while True:
                     cmd = self._cmd_q.get_nowait()
                     self._handle_command(cmd, driver, renderer)
+                    # Reset cached screen brightness so the next tick
+                    # re-evaluates against possibly-updated cfg.brightness.
+                    if cmd.startswith(("brightness:", "link_brightness:")):
+                        last_screen_pct = None
             except queue.Empty:
                 pass
 
             if self._stop_event.is_set():
                 break
 
-            # --- Tick ---
             now = time.monotonic()
+
+            # --- Reconnect with exponential backoff ---
+            if not driver.connected:
+                if now >= next_reconnect_at:
+                    log.info(
+                        "LED matrix not connected — attempting reconnect "
+                        "(next backoff: %.0f s) ...", backoff
+                    )
+                    if driver.reconnect():
+                        log.info("Reconnected to LED matrix")
+                        driver.sleep(False)
+                        backoff = _BACKOFF_INITIAL
+                        next_reconnect_at = 0.0
+                    else:
+                        next_reconnect_at = now + backoff
+                        log.info(
+                            "Reconnect failed — next attempt in %.0f s", backoff
+                        )
+                        backoff = min(backoff * 2.0, _BACKOFF_MAX)
+                time.sleep(0.05)
+                continue   # skip frame rendering until connected
+
+            # --- Tick ---
             if now - last_tick >= cfg.tick_interval:
                 last_tick = now
                 try:
                     stats = stats_collector.collect()
 
                     # Screen-brightness linking.
-                    # renderer.brightness is the sole brightness control;
-                    # hardware brightness is always 255 (normalised at connect).
+                    # Only re-compute when the raw screen percentage changes —
+                    # avoids redundant renderer updates and log spam.
                     if cfg.link_screen_brightness:
                         screen_pct = get_screen_brightness()
-                        if screen_pct is not None:
+                        log.debug(
+                            "Screen brightness read: %s%%  |  "
+                            "current matrix brightness: %d  |  ceiling: %d",
+                            screen_pct, renderer.brightness, cfg.brightness,
+                        )
+                        if screen_pct is not None and screen_pct != last_screen_pct:
                             effective = max(5, int(screen_pct / 100.0 * cfg.brightness))
-                            if effective != renderer.brightness:
-                                renderer.brightness = effective
-                                log.debug(
-                                    "Screen %d%% → renderer brightness %d (ceiling %d)",
-                                    screen_pct, effective, cfg.brightness,
-                                )
+                            log.info(
+                                "Screen brightness changed: %d%% → "
+                                "matrix brightness %d (ceiling %d)",
+                                screen_pct, effective, cfg.brightness,
+                            )
+                            renderer.brightness = effective
+                            last_screen_pct = screen_pct
 
                     frame = renderer.render(stats)
                     driver.draw_frame(frame)
@@ -125,8 +169,9 @@ class ServiceLoop:
 
             time.sleep(0.05)
 
-        driver.clear()
-        driver.sleep(True)
+        if driver.connected:
+            driver.clear()
+            driver.sleep(True)
         driver.disconnect()
         log.info("Service loop exited cleanly")
 
