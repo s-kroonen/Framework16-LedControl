@@ -60,25 +60,45 @@ except Exception:
 # Battery saver detection  (Windows only, zero-dependency)
 # ---------------------------------------------------------------------------
 
-class _SYSTEM_POWER_STATUS(ctypes.Structure):
-    _fields_ = [
-        ("ACLineStatus",       ctypes.c_byte),
-        ("BatteryFlag",        ctypes.c_byte),
-        ("BatteryLifePercent", ctypes.c_byte),
-        ("SystemStatusFlag",   ctypes.c_byte),   # bit 0 = Battery Saver on
-        ("BatteryLifeTime",    ctypes.c_ulong),
-        ("BatteryFullLifeTime", ctypes.c_ulong),
-    ]
-
-
 def get_battery_saver() -> bool:
-    """Return True if Windows Battery Saver mode is currently active."""
+    """Return True if Windows Battery Saver mode is currently active.
+
+    On Windows 11, GetSystemPowerStatus.SystemStatusFlag does not reliably
+    reflect Battery Saver state. The registry key EnergySaverState is used
+    as the primary source, with the API as fallback.
+    """
+    # Primary: registry key EnergySaverState under HKLM\...\Control\Power
+    # Values: 1 = Battery Saver active, 2 = configured but inactive, 0 = disabled
     try:
-        status = _SYSTEM_POWER_STATUS()
-        if ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(status)):
-            return bool(status.SystemStatusFlag & 1)
-    except Exception:
+        import winreg
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SYSTEM\CurrentControlSet\Control\Power",
+        ) as key:
+            val, _ = winreg.QueryValueEx(key, "EnergySaverState")
+            return val == 1
+    except FileNotFoundError:
         pass
+    except Exception as exc:
+        log.debug("get_battery_saver registry: %s", exc)
+
+    # Fallback: GetSystemPowerStatus (unreliable on some Windows 11 builds)
+    try:
+        class _SPS(ctypes.Structure):
+            _fields_ = [
+                ("ACLineStatus",       ctypes.c_ubyte),
+                ("BatteryFlag",        ctypes.c_ubyte),
+                ("BatteryLifePercent", ctypes.c_ubyte),
+                ("SystemStatusFlag",   ctypes.c_ubyte),
+                ("BatteryLifeTime",    ctypes.c_ulong),
+                ("BatteryFullLifeTime", ctypes.c_ulong),
+            ]
+        s = _SPS()
+        if ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(s)):
+            return bool(s.SystemStatusFlag & 1)
+    except Exception as exc:
+        log.debug("get_battery_saver API: %s", exc)
+
     return False
 
 

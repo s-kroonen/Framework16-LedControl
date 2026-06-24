@@ -75,6 +75,14 @@ _DEFAULT_SLOTS: list[Optional[str]] = [
     "net_rx", "net_tx", "cpu_temp", "temp_ddr",
 ]
 
+ALERT_MODES = ("none", "stripe", "stripe_blink", "bar_blink")
+ALERT_MODE_LABELS = {
+    "none":         "None",
+    "stripe":       "Stripe",
+    "stripe_blink": "Stripe + blink",
+    "bar_blink":    "Bar blink",
+}
+
 _DEFAULTS: dict[str, Any] = {
     "mode": "bars",
     "bar_slots": list(_DEFAULT_SLOTS),
@@ -86,6 +94,7 @@ _DEFAULTS: dict[str, Any] = {
     "sleep_when_idle": False,
     "idle_timeout_s": 300,
     "auto_off_battery_saver": False,
+    "alert_mode": "stripe",
 }
 
 

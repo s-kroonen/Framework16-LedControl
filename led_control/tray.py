@@ -43,7 +43,7 @@ except ImportError:
     pystray = None  # type: ignore
 
 from . import startup
-from .config import ALL_STAT_KEYS, STAT_LABELS, TEMP_STAT_KEYS, NUM_SLOTS, Config
+from .config import ALL_STAT_KEYS, ALERT_MODES, ALERT_MODE_LABELS, STAT_LABELS, TEMP_STAT_KEYS, NUM_SLOTS, Config
 
 log = logging.getLogger(__name__)
 
@@ -186,6 +186,17 @@ class TrayIcon:
                 Item("100%",  lambda icon, item: self._send("brightness:255")),
             ),
         )
+
+        # --- Alert mode ---
+        def _alert_items(c=cfg):
+            for am in ALERT_MODES:
+                yield Item(
+                    ALERT_MODE_LABELS[am],
+                    self._set_alert_mode_cb(am),
+                    checked=lambda item, m=am, c=c: c.alert_mode == m,
+                    radio=True,
+                )
+        yield Item("Alert mode", pystray.Menu(_alert_items))
         yield Item(
             "Link to screen brightness",
             self._toggle_link_brightness,
@@ -230,6 +241,12 @@ class TrayIcon:
         new = not self._config.auto_off_battery_saver
         self._config.auto_off_battery_saver = new
         self._send(f"auto_battery_saver:{'1' if new else '0'}")
+
+    def _set_alert_mode_cb(self, mode: str) -> Callable:
+        def cb(icon, item):
+            self._config.alert_mode = mode
+            self._send(f"set_alert_mode:{mode}")
+        return cb
 
     def _toggle_start_on_boot(self, icon, item) -> None:
         new = not startup.is_enabled()

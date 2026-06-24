@@ -167,53 +167,74 @@ def _stat_to_column(
     key: str,
     stats: SystemStats,
     rolls: dict[str, RollingMax] | None = None,
+    alert_mode: str = "stripe",
+    blink_on: bool = True,
 ) -> list[int]:
     """
     Render a stat key to a 34-row brightness column.
-    Pass `rolls` (a dict of RollingMax per rate-key) for dynamic scaling.
-    Bars stripe (alternating off rows) when the value exceeds its alert threshold.
+
+    Alert mode behaviour when threshold is exceeded:
+      "none"         — normal solid bar
+      "stripe"       — alternating rows off within lit region
+      "stripe_blink" — alternates between striped bar and solid bar each frame
+      "bar_blink"    — alternates between solid bar and dark (all off) each frame
     """
-    def _alert(raw: float) -> bool:
+    def _is_alert(raw: float) -> bool:
         th = _ALERT_THRESHOLDS.get(key)
         if th is None:
             return False
-        # Battery alert is triggered when BELOW the threshold (low battery)
-        if key == "battery":
-            return raw < th
-        return raw >= th
+        return raw < th if key == "battery" else raw >= th
+
+    def _pct(value: float) -> list[int]:
+        if not _is_alert(value) or alert_mode == "none":
+            return _bar_column(value)
+        if alert_mode == "stripe":
+            return _bar_column(value, alert=True)
+        if alert_mode == "stripe_blink":
+            # blink between striped and solid
+            return _bar_column(value, alert=True) if blink_on else _bar_column(value)
+        if alert_mode == "bar_blink":
+            # blink between solid and dark
+            return _bar_column(value) if blink_on else [0] * ROWS
+        return _bar_column(value)
 
     def _rate(value: float, roll_key: str) -> list[int]:
         ceil = rolls[roll_key].ceiling() if (rolls and roll_key in rolls) else max(value, 1.0)
-        return _rate_bar_column(value, ceil, alert=_alert(value))
+        if not _is_alert(value) or alert_mode == "none":
+            return _rate_bar_column(value, ceil)
+        if alert_mode == "stripe":
+            return _rate_bar_column(value, ceil, alert=True)
+        if alert_mode == "stripe_blink":
+            return _rate_bar_column(value, ceil, alert=True) if blink_on else _rate_bar_column(value, ceil)
+        if alert_mode == "bar_blink":
+            return _rate_bar_column(value, ceil) if blink_on else [0] * ROWS
+        return _rate_bar_column(value, ceil)
 
-    if key == "cpu":
-        return _bar_column(stats.cpu_percent, alert=_alert(stats.cpu_percent))
-    if key == "ram":
-        return _bar_column(stats.ram_percent, alert=_alert(stats.ram_percent))
-    if key == "gpu":
-        return _bar_column(stats.gpu_percent, alert=_alert(stats.gpu_percent))
-    if key == "gpu_vram":
-        return _bar_column(stats.gpu_vram_percent, alert=_alert(stats.gpu_vram_percent))
-    if key == "disk":
-        return _bar_column(stats.disk_percent, alert=_alert(stats.disk_percent))
-    if key == "disk_read":
-        return _rate(stats.disk_read_mbps, "disk_read")
-    if key == "disk_write":
-        return _rate(stats.disk_write_mbps, "disk_write")
-    if key == "net_rx":
-        return _rate(stats.net_recv_mbps, "net_rx")
-    if key == "net_tx":
-        return _rate(stats.net_sent_mbps, "net_tx")
-    if key == "battery":
-        return _bar_column(stats.battery_percent, alert=_alert(stats.battery_percent))
-    if key == "cpu_temp":
-        return _temp_bar_column(stats.cpu_temp_c, alert=_alert(stats.cpu_temp_c))
-    if key == "temp_ddr":
-        return _temp_bar_column(stats.temp_ddr_c, alert=_alert(stats.temp_ddr_c))
-    if key == "temp_local":
-        return _temp_bar_column(stats.temp_local_c, alert=_alert(stats.temp_local_c))
-    if key == "gpu_temp":
-        return _temp_bar_column(stats.gpu_temp_c, alert=_alert(stats.gpu_temp_c))
+    def _temp(temp_c: float) -> list[int]:
+        if not _is_alert(temp_c) or alert_mode == "none":
+            return _temp_bar_column(temp_c)
+        if alert_mode == "stripe":
+            return _temp_bar_column(temp_c, alert=True)
+        if alert_mode == "stripe_blink":
+            return _temp_bar_column(temp_c, alert=True) if blink_on else _temp_bar_column(temp_c)
+        if alert_mode == "bar_blink":
+            return _temp_bar_column(temp_c) if blink_on else [0] * ROWS
+        return _temp_bar_column(temp_c)
+
+    if key == "cpu":        return _pct(stats.cpu_percent)
+    if key == "ram":        return _pct(stats.ram_percent)
+    if key == "gpu":        return _pct(stats.gpu_percent)
+    if key == "gpu_vram":   return _pct(stats.gpu_vram_percent)
+    if key == "disk":       return _pct(stats.disk_percent)
+    if key == "disk_read":  return _rate(stats.disk_read_mbps,  "disk_read")
+    if key == "disk_write": return _rate(stats.disk_write_mbps, "disk_write")
+    if key == "net_rx":     return _rate(stats.net_recv_mbps,   "net_rx")
+    if key == "net_tx":     return _rate(stats.net_sent_mbps,   "net_tx")
+    if key == "battery":    return _pct(stats.battery_percent)
+    if key == "cpu_temp":   return _temp(stats.cpu_temp_c)
+    if key == "temp_ddr":   return _temp(stats.temp_ddr_c)
+    if key == "temp_local": return _temp(stats.temp_local_c)
+    if key == "gpu_temp":   return _temp(stats.gpu_temp_c)
     return [0] * ROWS
 
 
@@ -225,6 +246,8 @@ def render_bars(
     stats: SystemStats,
     slots: list[Optional[str]],
     rolls: dict[str, RollingMax] | None = None,
+    alert_mode: str = "stripe",
+    blink_on: bool = True,
 ) -> Frame:
     """
     Render 9 bar-graph columns from the slot assignment list.
@@ -234,7 +257,7 @@ def render_bars(
     frame = _empty_frame()
     for col, key in enumerate(slots[:COLS]):
         if key is not None:
-            frame[col] = _stat_to_column(key, stats, rolls)
+            frame[col] = _stat_to_column(key, stats, rolls, alert_mode=alert_mode, blink_on=blink_on)
     return frame
 
 
@@ -319,11 +342,13 @@ class Renderer:
         mode: str = "bars",
         brightness: int = 180,
         bar_slots: list[Optional[str]] | None = None,
+        alert_mode: str = "stripe",
     ):
         if mode not in MODES:
             raise ValueError(f"Unknown mode '{mode}'. Choose from {MODES}")
         self.mode = mode
         self.brightness = brightness
+        self.alert_mode = alert_mode
         from .config import ALL_STAT_KEYS
         self.bar_slots: list[Optional[str]] = (
             bar_slots if bar_slots is not None else list(ALL_STAT_KEYS)
@@ -336,6 +361,7 @@ class Renderer:
             "disk_read":  RollingMax(floor=0.5),   # MB/s
             "disk_write": RollingMax(floor=0.5),
         }
+        self._render_count = 0   # flipped each call; drives blink toggle
 
     def _update_rolls(self, stats: SystemStats) -> None:
         self._rolls["net_rx"].update(stats.net_recv_mbps)
@@ -345,9 +371,12 @@ class Renderer:
 
     def render(self, stats: SystemStats) -> Frame:
         self._update_rolls(stats)
+        self._render_count += 1
+        blink_on = self._render_count % 2 == 0   # alternates every frame
 
         if self.mode == "bars":
-            frame = render_bars(stats, self.bar_slots, self._rolls)
+            frame = render_bars(stats, self.bar_slots, self._rolls,
+                                alert_mode=self.alert_mode, blink_on=blink_on)
         elif self.mode == "cpu_cores":
             frame = render_cpu_cores(stats)
         elif self.mode == "clock":

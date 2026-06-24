@@ -93,6 +93,7 @@ class ServiceLoop:
             mode=cfg.mode,
             brightness=cfg.brightness,
             bar_slots=list(cfg.bar_slots),
+            alert_mode=cfg.alert_mode,
         )
 
         if driver.connected:
@@ -116,7 +117,7 @@ class ServiceLoop:
         _force_on = False
 
         # Shared mutable state accessed by _handle_command
-        state = {"force_on": False, "batt_saver_sleeping": False}
+        state = {"force_on": False, "batt_saver_sleeping": False, "manual_sleep": False}
 
         last_tick = 0.0
 
@@ -162,6 +163,10 @@ class ServiceLoop:
             _batt_saver_sleeping = state["batt_saver_sleeping"]
             if cfg.auto_off_battery_saver:
                 batt_saver_active = get_battery_saver()
+                log.debug(
+                    "Battery saver poll: active=%s sleeping=%s force_on=%s",
+                    batt_saver_active, _batt_saver_sleeping, _force_on,
+                )
                 if batt_saver_active and not _force_on and not _batt_saver_sleeping:
                     log.info("Battery Saver active — sleeping LED matrix")
                     driver.sleep(True)
@@ -170,9 +175,12 @@ class ServiceLoop:
                     log.info("Battery Saver off — waking LED matrix")
                     driver.sleep(False)
                     state["batt_saver_sleeping"] = False
+                    state["manual_sleep"] = False
                     state["force_on"] = False
+            else:
+                log.debug("Battery saver auto-off disabled (toggle it in tray)")
 
-            if state["batt_saver_sleeping"]:
+            if state["batt_saver_sleeping"] or state["manual_sleep"]:
                 time.sleep(0.5)
                 continue
 
@@ -270,13 +278,13 @@ class ServiceLoop:
             log.info("Screen brightness linking: %s", "on" if enabled else "off")
 
         elif cmd == "sleep":
-            # Manual sleep — also clears force-on so battery saver can resume control
+            state["manual_sleep"] = True
             state["force_on"] = False
             state["batt_saver_sleeping"] = False
             driver.sleep(True)
 
         elif cmd == "wake":
-            # Wake and override any battery-saver auto-off
+            state["manual_sleep"] = False
             state["force_on"] = True
             state["batt_saver_sleeping"] = False
             driver.sleep(False)
@@ -293,11 +301,22 @@ class ServiceLoop:
                 driver.sleep(False)
             log.info("Auto-off on battery saver: %s", "on" if enabled else "off")
 
+        elif cmd.startswith("set_alert_mode:"):
+            from .config import ALERT_MODES
+            new_mode = cmd.split(":", 1)[1]
+            if new_mode in ALERT_MODES:
+                renderer.alert_mode = new_mode
+                cfg.alert_mode = new_mode
+                cfg.save()
+            else:
+                log.warning("Unknown alert mode: %s", new_mode)
+
         elif cmd == "reload_config":
             cfg.load()
             renderer.mode = cfg.mode
             renderer.brightness = cfg.brightness
             renderer.bar_slots = list(cfg.bar_slots)
+            renderer.alert_mode = cfg.alert_mode
 
         else:
             log.warning("Unknown command: %s", cmd)
