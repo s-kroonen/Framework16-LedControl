@@ -75,6 +75,25 @@ _FONT_4X7: dict[str, list[int]] = {
 # Fixed ceiling for temperature bars (°C → 100 %)
 _TEMP_MAX = 100.0
 
+# Alert thresholds — bar shows a stripe pattern when the raw value meets/exceeds this.
+# For "battery" the alert is triggered when BELOW the threshold (low battery).
+_ALERT_THRESHOLDS: dict[str, float] = {
+    "cpu":        90.0,   # %
+    "ram":        90.0,   # %
+    "gpu":        90.0,   # %
+    "gpu_vram":   90.0,   # %
+    "disk":       90.0,   # I/O busy %
+    "disk_read":  200.0,  # MB/s
+    "disk_write": 200.0,  # MB/s
+    "net_rx":     100.0,  # Mbit/s
+    "net_tx":     100.0,  # Mbit/s
+    "cpu_temp":   85.0,   # °C
+    "gpu_temp":   85.0,   # °C
+    "temp_ddr":   70.0,   # °C
+    "temp_local": 60.0,   # °C
+    "battery":    20.0,   # % (alert when BELOW this — low battery)
+}
+
 
 # ---------------------------------------------------------------------------
 # Per-column rendering helpers
@@ -84,20 +103,22 @@ def _empty_frame() -> Frame:
     return [[0] * ROWS for _ in range(COLS)]
 
 
-def _bar_column(value_pct: float, brightness: int = 200) -> list[int]:
-    """Vertical bar filling from bottom; value_pct 0–100."""
+def _bar_column(value_pct: float, brightness: int = 200, alert: bool = False) -> list[int]:
+    """Vertical bar filling from bottom; value_pct 0–100.
+    When alert=True, every other lit row is turned off (stripe from bottom up)."""
     lit = round(max(0.0, min(100.0, value_pct)) / 100.0 * ROWS)
     col = [0] * ROWS
-    for row in range(ROWS - lit, ROWS):
-        col[row] = brightness
+    # Enumerate from bottom so i=0 (bottom) is always ON
+    for i, row in enumerate(range(ROWS - 1, ROWS - lit - 1, -1)):
+        col[row] = brightness if (not alert or i % 2 == 0) else 0
     return col
 
 
-def _temp_bar_column(temp_c: float) -> list[int]:
+def _temp_bar_column(temp_c: float, alert: bool = False) -> list[int]:
     """Bar height and brightness both scale with temperature."""
     pct = min(100.0, temp_c / _TEMP_MAX * 100.0)
     brightness = max(30, int(pct / 100.0 * 255))
-    return _bar_column(pct, brightness)
+    return _bar_column(pct, brightness, alert=alert)
 
 
 # ---------------------------------------------------------------------------
@@ -136,10 +157,10 @@ class RollingMax:
         return max(self._floor, self._value * headroom)
 
 
-def _rate_bar_column(value: float, ceiling: float) -> list[int]:
+def _rate_bar_column(value: float, ceiling: float, alert: bool = False) -> list[int]:
     """Bar for a rate metric scaled against a dynamic ceiling."""
     pct = min(100.0, value / max(ceiling, 1e-9) * 100.0)
-    return _bar_column(pct, 180)
+    return _bar_column(pct, 180, alert=alert)
 
 
 def _stat_to_column(
@@ -150,28 +171,50 @@ def _stat_to_column(
     """
     Render a stat key to a 34-row brightness column.
     Pass `rolls` (a dict of RollingMax per rate-key) for dynamic scaling.
+    Bars stripe (alternating off rows) when the value exceeds its alert threshold.
     """
-    def _rate(value: float, roll_key: str) -> list[int]:
-        if rolls and roll_key in rolls:
-            return _rate_bar_column(value, rolls[roll_key].ceiling())
-        return _bar_column(min(100.0, value), 180)
+    def _alert(raw: float) -> bool:
+        th = _ALERT_THRESHOLDS.get(key)
+        if th is None:
+            return False
+        # Battery alert is triggered when BELOW the threshold (low battery)
+        if key == "battery":
+            return raw < th
+        return raw >= th
 
-    dispatch: dict[str, list[int]] = {
-        "cpu":        _bar_column(stats.cpu_percent),
-        "ram":        _bar_column(stats.ram_percent),
-        "gpu":        _bar_column(stats.gpu_percent),
-        "gpu_vram":   _bar_column(stats.gpu_vram_percent),
-        "disk":       _bar_column(stats.disk_percent),
-        "disk_read":  _rate(stats.disk_read_mbps,  "disk_read"),
-        "disk_write": _rate(stats.disk_write_mbps, "disk_write"),
-        "net_rx":     _rate(stats.net_recv_mbps,   "net_rx"),
-        "net_tx":     _rate(stats.net_sent_mbps,   "net_tx"),
-        "cpu_temp":   _temp_bar_column(stats.cpu_temp_c),
-        "temp_ddr":   _temp_bar_column(stats.temp_ddr_c),
-        "temp_local": _temp_bar_column(stats.temp_local_c),
-        "gpu_temp":   _temp_bar_column(stats.gpu_temp_c),
-    }
-    return dispatch.get(key, [0] * ROWS)
+    def _rate(value: float, roll_key: str) -> list[int]:
+        ceil = rolls[roll_key].ceiling() if (rolls and roll_key in rolls) else max(value, 1.0)
+        return _rate_bar_column(value, ceil, alert=_alert(value))
+
+    if key == "cpu":
+        return _bar_column(stats.cpu_percent, alert=_alert(stats.cpu_percent))
+    if key == "ram":
+        return _bar_column(stats.ram_percent, alert=_alert(stats.ram_percent))
+    if key == "gpu":
+        return _bar_column(stats.gpu_percent, alert=_alert(stats.gpu_percent))
+    if key == "gpu_vram":
+        return _bar_column(stats.gpu_vram_percent, alert=_alert(stats.gpu_vram_percent))
+    if key == "disk":
+        return _bar_column(stats.disk_percent, alert=_alert(stats.disk_percent))
+    if key == "disk_read":
+        return _rate(stats.disk_read_mbps, "disk_read")
+    if key == "disk_write":
+        return _rate(stats.disk_write_mbps, "disk_write")
+    if key == "net_rx":
+        return _rate(stats.net_recv_mbps, "net_rx")
+    if key == "net_tx":
+        return _rate(stats.net_sent_mbps, "net_tx")
+    if key == "battery":
+        return _bar_column(stats.battery_percent, alert=_alert(stats.battery_percent))
+    if key == "cpu_temp":
+        return _temp_bar_column(stats.cpu_temp_c, alert=_alert(stats.cpu_temp_c))
+    if key == "temp_ddr":
+        return _temp_bar_column(stats.temp_ddr_c, alert=_alert(stats.temp_ddr_c))
+    if key == "temp_local":
+        return _temp_bar_column(stats.temp_local_c, alert=_alert(stats.temp_local_c))
+    if key == "gpu_temp":
+        return _temp_bar_column(stats.gpu_temp_c, alert=_alert(stats.gpu_temp_c))
+    return [0] * ROWS
 
 
 # ---------------------------------------------------------------------------

@@ -42,6 +42,7 @@ ALL_STAT_KEYS: list[str] = [
     "cpu", "ram", "gpu", "gpu_vram",
     "disk", "disk_read", "disk_write",
     "net_rx", "net_tx",
+    "battery",
     # Temperature sensors (hardware monitor required)
     "cpu_temp", "temp_ddr", "temp_local", "gpu_temp",
 ]
@@ -60,6 +61,7 @@ STAT_LABELS: dict[str, str] = {
     "disk_write": "Disk write MB/s",
     "net_rx":     "Net down Mbit/s",
     "net_tx":     "Net up Mbit/s",
+    "battery":    "Battery %",
     "cpu_temp":   "CPU temp (APU)",
     "temp_ddr":   "DDR temp",
     "temp_local": "Local temp",
@@ -83,6 +85,7 @@ _DEFAULTS: dict[str, Any] = {
     "serial_port": None,
     "sleep_when_idle": False,
     "idle_timeout_s": 300,
+    "auto_off_battery_saver": False,
 }
 
 

@@ -12,17 +12,28 @@ maps sensor names to stat keys:
   temp_local ← F75303_Local (ambient near F75303 chip)
   gpu_temp   ← dGPU AMB / GPU Core (zero if no dGPU installed)
 
-Without a hardware monitor running, temperature stats return 0.
+iGPU load is also read from LibreHardwareMonitor / OHM when available.
+Without a hardware monitor running, temperature and iGPU stats return 0.
 
 Disk metrics
 ────────────
   disk_percent    I/O busy % (read_time + write_time delta / elapsed).
   disk_read_mbps  Read throughput MB/s.
   disk_write_mbps Write throughput MB/s.
+
+Battery
+───────
+  battery_percent  Battery charge % (0–100).  100 when AC-only device.
+
+Battery saver
+─────────────
+  get_battery_saver()  Returns True when Windows Battery Saver is active.
 """
 
 from __future__ import annotations
 
+import ctypes
+import ctypes.wintypes
 import logging
 import time
 from dataclasses import dataclass, field
@@ -43,6 +54,32 @@ try:
     _WMI_AVAILABLE = True
 except Exception:
     _WMI_AVAILABLE = False
+
+
+# ---------------------------------------------------------------------------
+# Battery saver detection  (Windows only, zero-dependency)
+# ---------------------------------------------------------------------------
+
+class _SYSTEM_POWER_STATUS(ctypes.Structure):
+    _fields_ = [
+        ("ACLineStatus",       ctypes.c_byte),
+        ("BatteryFlag",        ctypes.c_byte),
+        ("BatteryLifePercent", ctypes.c_byte),
+        ("SystemStatusFlag",   ctypes.c_byte),   # bit 0 = Battery Saver on
+        ("BatteryLifeTime",    ctypes.c_ulong),
+        ("BatteryFullLifeTime", ctypes.c_ulong),
+    ]
+
+
+def get_battery_saver() -> bool:
+    """Return True if Windows Battery Saver mode is currently active."""
+    try:
+        status = _SYSTEM_POWER_STATUS()
+        if ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(status)):
+            return bool(status.SystemStatusFlag & 1)
+    except Exception:
+        pass
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -104,7 +141,7 @@ class TempSensorReader:
         "root\\OpenHardwareMonitor",
     ]
 
-    # Ordered candidate names for each stat key
+    # Ordered candidate names for each Temperature sensor key
     _CANDIDATES: Dict[str, List[str]] = {
         "cpu_temp":   ["F75303_CPU", "CPU Package", "CPU Tdie", "Tctl/Tdie"],
         "temp_ddr":   ["F75303_DDR", "T_MEM", "DDR"],
@@ -112,10 +149,17 @@ class TempSensorReader:
         "gpu_temp":   ["dGPU AMB", "GPU Core", "GPU"],
     }
 
+    # Ordered candidate names for Load-type sensor keys (iGPU, etc.)
+    _LOAD_CANDIDATES: Dict[str, List[str]] = {
+        "gpu_percent": ["GPU Core", "GPU D3D 3D", "GPU", "D3D 3D"],
+    }
+
     def __init__(self) -> None:
         self._wmi: Any = None
-        # stat_key -> exact sensor name in WMI
+        # stat_key -> exact sensor name in WMI (Temperature sensors)
         self._key_to_sensor: Dict[str, str] = {}
+        # stat_key -> exact sensor name in WMI (Load sensors)
+        self._key_to_load_sensor: Dict[str, str] = {}
 
     def init(self) -> None:
         """Connect to hardware monitor WMI namespace. Call on service thread."""
@@ -126,32 +170,45 @@ class TempSensorReader:
         for ns in self._NAMESPACES:
             try:
                 w = wmi.WMI(namespace=ns)
-                available: Dict[str, float] = {}
+                temp_avail: Dict[str, float] = {}
+                load_avail: Dict[str, float] = {}
                 for s in w.Sensor():
-                    if s.SensorType == "Temperature" and s.Value is not None:
-                        available[s.Name] = float(s.Value)
+                    if s.Value is None:
+                        continue
+                    if s.SensorType == "Temperature":
+                        temp_avail[s.Name] = float(s.Value)
+                    elif s.SensorType == "Load":
+                        load_avail[s.Name] = float(s.Value)
 
-                if not available:
-                    log.debug("%s: no temperature sensors found", ns)
+                if not temp_avail and not load_avail:
+                    log.debug("%s: no sensors found", ns)
                     continue
 
-                # Build key → sensor-name map
-                mapping: Dict[str, str] = {}
+                # Build temperature key → sensor-name map
+                temp_mapping: Dict[str, str] = {}
                 for key, candidates in self._CANDIDATES.items():
                     for name in candidates:
-                        if name in available:
-                            mapping[key] = name
+                        if name in temp_avail:
+                            temp_mapping[key] = name
                             break
 
-                if mapping:
+                # Build load key → sensor-name map
+                load_mapping: Dict[str, str] = {}
+                for key, candidates in self._LOAD_CANDIDATES.items():
+                    for name in candidates:
+                        if name in load_avail:
+                            load_mapping[key] = name
+                            break
+
+                if temp_mapping or load_mapping:
                     self._wmi = w
-                    self._key_to_sensor = mapping
+                    self._key_to_sensor = temp_mapping
+                    self._key_to_load_sensor = load_mapping
                     log.info(
-                        "Hardware temperature sensors: namespace=%s  mapped=%s  "
-                        "available=%s",
+                        "Hardware sensors: namespace=%s  temps=%s  loads=%s",
                         ns,
-                        {k: v for k, v in mapping.items()},
-                        sorted(available.keys()),
+                        list(temp_mapping.keys()),
+                        list(load_mapping.keys()),
                     )
                     return
                 else:
@@ -167,26 +224,35 @@ class TempSensorReader:
         )
 
     def read(self) -> Dict[str, float]:
-        """Return {stat_key: temp_celsius} for all mapped sensors."""
+        """Return {stat_key: value} for all mapped sensors (temps in °C, loads in %)."""
         if self._wmi is None:
             return {}
         try:
-            live: Dict[str, float] = {}
+            temp_live: Dict[str, float] = {}
+            load_live: Dict[str, float] = {}
             for s in self._wmi.Sensor():
-                if s.SensorType == "Temperature" and s.Value is not None:
-                    live[s.Name] = float(s.Value)
-            return {
-                key: live[name]
-                for key, name in self._key_to_sensor.items()
-                if name in live
-            }
+                if s.Value is None:
+                    continue
+                if s.SensorType == "Temperature":
+                    temp_live[s.Name] = float(s.Value)
+                elif s.SensorType == "Load":
+                    load_live[s.Name] = float(s.Value)
+
+            result: Dict[str, float] = {}
+            for key, name in self._key_to_sensor.items():
+                if name in temp_live:
+                    result[key] = temp_live[name]
+            for key, name in self._key_to_load_sensor.items():
+                if name in load_live:
+                    result[key] = load_live[name]
+            return result
         except Exception as exc:
             log.debug("TempSensorReader.read error: %s", exc)
             return {}
 
     @property
     def mapped_keys(self) -> List[str]:
-        return list(self._key_to_sensor.keys())
+        return list(self._key_to_sensor.keys()) + list(self._key_to_load_sensor.keys())
 
 
 # ---------------------------------------------------------------------------
@@ -204,7 +270,7 @@ class SystemStats:
     disk_percent: float = 0.0       # I/O busy %
     disk_read_mbps: float = 0.0
     disk_write_mbps: float = 0.0
-    gpu_percent: float = 0.0
+    gpu_percent: float = 0.0        # iGPU load % (from LHM) or dGPU (GPUtil)
     gpu_vram_percent: float = 0.0
     gpu_temp_c: float = 0.0         # dGPU AMB or GPU Core
     cpu_temp_c: float = 0.0         # F75303_CPU / APU die
@@ -212,6 +278,7 @@ class SystemStats:
     temp_local_c: float = 0.0       # F75303_Local / ambient
     net_sent_mbps: float = 0.0
     net_recv_mbps: float = 0.0
+    battery_percent: float = 100.0  # battery charge % (100 when on AC)
 
 
 # ---------------------------------------------------------------------------
@@ -312,6 +379,16 @@ class StatsCollector:
 
     # ------------------------------------------------------------------
 
+    def _battery(self) -> float:
+        """Return battery charge % (0–100), or 100.0 when on AC without battery."""
+        try:
+            b = psutil.sensors_battery()
+            if b is not None:
+                return max(0.0, min(100.0, b.percent))
+        except Exception:
+            pass
+        return 100.0
+
     def collect(self) -> SystemStats:
         now = time.monotonic()
         dt  = max(0.001, now - self._prev_io_ts)
@@ -322,13 +399,15 @@ class StatsCollector:
         disk_act, disk_r, disk_w     = self._disk(dt)
         gpu_load, gpu_vram, gpu_temp = self._gpu()
         sent, recv               = self._net(dt)
+        battery                  = self._battery()
 
-        # Hardware monitor temperatures
-        temps = self._temp_reader.read()
-        cpu_temp   = temps.get("cpu_temp",   0.0)
-        temp_ddr   = temps.get("temp_ddr",   0.0)
-        temp_local = temps.get("temp_local", 0.0)
-        _gpu_temp  = temps.get("gpu_temp",   gpu_temp)  # prefer HW monitor
+        # Hardware monitor sensors (temps + iGPU load if LHM/OHM running)
+        hw = self._temp_reader.read()
+        cpu_temp   = hw.get("cpu_temp",    0.0)
+        temp_ddr   = hw.get("temp_ddr",    0.0)
+        temp_local = hw.get("temp_local",  0.0)
+        _gpu_temp  = hw.get("gpu_temp",    gpu_temp)   # prefer HW monitor
+        _gpu_load  = hw.get("gpu_percent", gpu_load)   # iGPU load from LHM
 
         return SystemStats(
             cpu_percent     = cpu,
@@ -339,7 +418,7 @@ class StatsCollector:
             disk_percent    = disk_act,
             disk_read_mbps  = disk_r,
             disk_write_mbps = disk_w,
-            gpu_percent     = gpu_load,
+            gpu_percent     = _gpu_load,
             gpu_vram_percent= gpu_vram,
             gpu_temp_c      = _gpu_temp,
             cpu_temp_c      = cpu_temp,
@@ -347,4 +426,5 @@ class StatsCollector:
             temp_local_c    = temp_local,
             net_sent_mbps   = sent,
             net_recv_mbps   = recv,
+            battery_percent = battery,
         )

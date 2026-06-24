@@ -84,3 +84,45 @@ def sync(enabled: bool) -> None:
         enable()
     else:
         disable()
+
+
+def launch_background() -> None:
+    """Launch a new background instance of the app (no console window)."""
+    import subprocess
+    cmd = _launch_command()
+    try:
+        subprocess.Popen(
+            cmd,
+            shell=True,
+            creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+            close_fds=True,
+        )
+        log.info("Background instance launched: %s", cmd)
+    except Exception as exc:
+        log.error("launch_background failed: %s", exc)
+
+
+def create_start_menu_shortcut() -> None:
+    """Create a Start Menu shortcut so the app can be launched without a terminal."""
+    try:
+        import win32com.client  # type: ignore  (pywin32)
+        shell = win32com.client.Dispatch("WScript.Shell")
+        programs_dir = shell.SpecialFolders("Programs")
+        link_path = os.path.join(programs_dir, f"{_APP_NAME}.lnk")
+        sc = shell.CreateShortCut(link_path)
+        if getattr(sys, "frozen", False):
+            sc.Targetpath = sys.executable
+            sc.WorkingDirectory = os.path.dirname(sys.executable)
+        else:
+            pythonw = sys.executable.replace("python.exe", "pythonw.exe")
+            if not os.path.exists(pythonw):
+                pythonw = sys.executable
+            script = os.path.abspath(sys.argv[0])
+            sc.Targetpath = pythonw
+            sc.Arguments = f'"{script}"'
+            sc.WorkingDirectory = os.path.dirname(script)
+        sc.Description = "Framework 16 LED Matrix Control"
+        sc.save()
+        log.info("Start Menu shortcut created: %s", link_path)
+    except Exception as exc:
+        log.warning("create_start_menu_shortcut: %s", exc)

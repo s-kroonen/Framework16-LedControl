@@ -201,11 +201,20 @@ class TrayIcon:
         )
         yield pystray.Menu.SEPARATOR
 
-        # --- Hardware control ---
-        yield Item("Sleep matrix", lambda icon, item: self._send("sleep"))
-        yield Item("Wake matrix",  lambda icon, item: self._send("wake"))
+        # --- Battery saver ---
+        yield Item(
+            "Auto-off on Battery Saver",
+            self._toggle_battery_saver,
+            checked=lambda item: bool(cfg.auto_off_battery_saver),
+        )
         yield pystray.Menu.SEPARATOR
 
+        # --- Hardware control ---
+        yield Item("Sleep matrix", lambda icon, item: self._send("sleep"))
+        yield Item("Wake matrix (force on)", lambda icon, item: self._send("wake"))
+        yield pystray.Menu.SEPARATOR
+
+        yield Item("Restart", self._restart_cb)
         yield Item("Quit", self._quit_cb)
 
     # ------------------------------------------------------------------
@@ -217,11 +226,23 @@ class TrayIcon:
         self._config.link_screen_brightness = new
         self._send(f"link_brightness:{'1' if new else '0'}")
 
+    def _toggle_battery_saver(self, icon, item) -> None:
+        new = not self._config.auto_off_battery_saver
+        self._config.auto_off_battery_saver = new
+        self._send(f"auto_battery_saver:{'1' if new else '0'}")
+
     def _toggle_start_on_boot(self, icon, item) -> None:
         new = not startup.is_enabled()
         startup.sync(new)
         self._config.start_on_boot = new
         self._config.save()
+
+    def _restart_cb(self, icon, item) -> None:
+        from . import startup
+        startup.launch_background()
+        self._send("quit")
+        icon.stop()
+        self._on_quit()
 
     def _quit_cb(self, icon, item) -> None:
         self._send("quit")

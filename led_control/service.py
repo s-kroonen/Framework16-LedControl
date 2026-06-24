@@ -8,18 +8,19 @@ Runs in a dedicated daemon thread.  On each tick it:
   4. Pushes the frame to the LED matrix
 
 Supported command strings (placed in the queue by tray.py):
-  "quit"                  — stop the loop and exit
-  "mode:bars"             — switch display mode
+  "quit"                      — stop the loop and exit
+  "mode:bars"                 — switch display mode
   "mode:cpu_cores"
   "mode:clock"
   "mode:breathe"
-  "brightness:180"        — set brightness ceiling (0–255)
-  "set_slot:3:gpu"        — assign stat key to column slot (0-based index)
-  "set_slot:3:None"       — clear a slot (dark column)
-  "sleep"                 — put matrix to sleep
-  "wake"                  — wake matrix
-  "link_brightness:1"     — enable/disable screen-brightness linking (0/1)
-  "reload_config"         — re-read config from disk
+  "brightness:180"            — set brightness ceiling (0–255)
+  "set_slot:3:gpu"            — assign stat key to column slot (0-based index)
+  "set_slot:3:None"           — clear a slot (dark column)
+  "sleep"                     — put matrix to sleep (clears force-on override)
+  "wake"                      — wake matrix and override battery-saver auto-off
+  "link_brightness:1"         — enable/disable screen-brightness linking (0/1)
+  "auto_battery_saver:1"      — enable/disable auto-off when Battery Saver is on
+  "reload_config"             — re-read config from disk
 """
 
 from __future__ import annotations
@@ -32,7 +33,7 @@ import time
 from .config import Config, ALL_STAT_KEYS
 from .led_driver import LedDriver
 from .renderer import Renderer
-from .stats import StatsCollector, get_screen_brightness, init_wmi_brightness
+from .stats import StatsCollector, get_battery_saver, get_screen_brightness, init_wmi_brightness
 
 log = logging.getLogger(__name__)
 
@@ -108,6 +109,15 @@ class ServiceLoop:
         # renderer updates (and emit logs) when the value actually changes.
         last_screen_pct: int | None = None
 
+        # --- Battery-saver auto-off state ---
+        # _batt_saver_sleeping: matrix was auto-slept due to battery saver
+        # _force_on: user explicitly woke the matrix, overrides battery saver
+        _batt_saver_sleeping = False
+        _force_on = False
+
+        # Shared mutable state accessed by _handle_command
+        state = {"force_on": False, "batt_saver_sleeping": False}
+
         last_tick = 0.0
 
         while not self._stop_event.is_set():
@@ -115,9 +125,7 @@ class ServiceLoop:
             try:
                 while True:
                     cmd = self._cmd_q.get_nowait()
-                    self._handle_command(cmd, driver, renderer)
-                    # Reset cached screen brightness so the next tick
-                    # re-evaluates against possibly-updated cfg.brightness.
+                    self._handle_command(cmd, driver, renderer, state)
                     if cmd.startswith(("brightness:", "link_brightness:")):
                         last_screen_pct = None
             except queue.Empty:
@@ -149,6 +157,25 @@ class ServiceLoop:
                 time.sleep(0.05)
                 continue   # skip frame rendering until connected
 
+            # --- Battery-saver auto-off ---
+            _force_on = state["force_on"]
+            _batt_saver_sleeping = state["batt_saver_sleeping"]
+            if cfg.auto_off_battery_saver:
+                batt_saver_active = get_battery_saver()
+                if batt_saver_active and not _force_on and not _batt_saver_sleeping:
+                    log.info("Battery Saver active — sleeping LED matrix")
+                    driver.sleep(True)
+                    state["batt_saver_sleeping"] = True
+                elif not batt_saver_active and _batt_saver_sleeping:
+                    log.info("Battery Saver off — waking LED matrix")
+                    driver.sleep(False)
+                    state["batt_saver_sleeping"] = False
+                    state["force_on"] = False
+
+            if state["batt_saver_sleeping"]:
+                time.sleep(0.5)
+                continue
+
             # --- Tick ---
             if now - last_tick >= cfg.tick_interval:
                 last_tick = now
@@ -156,8 +183,6 @@ class ServiceLoop:
                     stats = stats_collector.collect()
 
                     # Screen-brightness linking.
-                    # Only re-compute when the raw screen percentage changes —
-                    # avoids redundant renderer updates and log spam.
                     if cfg.link_screen_brightness:
                         screen_pct = get_screen_brightness()
                         if screen_pct is not None and screen_pct != last_screen_pct:
@@ -195,6 +220,7 @@ class ServiceLoop:
         cmd: str,
         driver: LedDriver,
         renderer: Renderer,
+        state: dict,
     ) -> None:
         log.debug("Command: %s", cmd)
         cfg = self._config
@@ -231,7 +257,7 @@ class ServiceLoop:
                         cfg.set_slot(idx, key)
                         renderer.bar_slots = list(cfg.bar_slots)
                         cfg.save()
-                        log.debug("Slot %d → %s", idx, key)
+                        log.debug("Slot %d -> %s", idx, key)
                 except (ValueError, IndexError) as exc:
                     log.warning("set_slot error: %s (%s)", cmd, exc)
 
@@ -239,16 +265,33 @@ class ServiceLoop:
             enabled = cmd.split(":", 1)[1] == "1"
             cfg.link_screen_brightness = enabled
             if not enabled:
-                # Restore configured brightness ceiling when unlinking
                 renderer.brightness = cfg.brightness
             cfg.save()
             log.info("Screen brightness linking: %s", "on" if enabled else "off")
 
         elif cmd == "sleep":
+            # Manual sleep — also clears force-on so battery saver can resume control
+            state["force_on"] = False
+            state["batt_saver_sleeping"] = False
             driver.sleep(True)
 
         elif cmd == "wake":
+            # Wake and override any battery-saver auto-off
+            state["force_on"] = True
+            state["batt_saver_sleeping"] = False
             driver.sleep(False)
+            log.info("Matrix woken (battery saver override: on)")
+
+        elif cmd.startswith("auto_battery_saver:"):
+            enabled = cmd.split(":", 1)[1] == "1"
+            cfg.auto_off_battery_saver = enabled
+            cfg.save()
+            if not enabled and state["batt_saver_sleeping"]:
+                # Re-enable display when feature is turned off
+                state["batt_saver_sleeping"] = False
+                state["force_on"] = False
+                driver.sleep(False)
+            log.info("Auto-off on battery saver: %s", "on" if enabled else "off")
 
         elif cmd == "reload_config":
             cfg.load()

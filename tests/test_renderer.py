@@ -23,6 +23,7 @@ def _dummy_stats(**kwargs) -> SystemStats:
         temp_ddr_c=45.0,
         temp_local_c=38.0,
         net_sent_mbps=1.0, net_recv_mbps=5.0,
+        battery_percent=80.0,
     )
     defaults.update(kwargs)
     return SystemStats(**defaults)
@@ -111,6 +112,7 @@ class TestRenderBars:
             disk_percent=0, disk_read_mbps=0, disk_write_mbps=0,
             net_sent_mbps=0, net_recv_mbps=0,
             cpu_temp_c=0, gpu_temp_c=0, temp_ddr_c=0, temp_local_c=0,
+            battery_percent=0,
         )
         frame = render_bars(stats, _ALL_SLOTS)
         assert all(v == 0 for col in frame for v in col)
@@ -144,17 +146,16 @@ class TestRenderBars:
         _validate_frame(frame)
 
     def test_disk_activity_bar(self):
-        """disk_percent is I/O activity %; 100% should fully light its column."""
+        """disk_percent is I/O activity %; 100% triggers alert stripe — bottom always lit."""
         stats = _dummy_stats(disk_percent=100)
         frame = render_bars(stats, ["disk"] + [None] * 8)
         assert frame[0][ROWS - 1] > 0, "Full disk activity should light bottom row"
-        assert frame[0][0] > 0, "Full disk activity should light top row"
+        # At 100% the alert stripe is active; top row may be dark (stripe pattern)
 
     def test_disk_read_bar(self):
-        stats = _dummy_stats(disk_read_mbps=500)  # at ceiling → full bar
+        stats = _dummy_stats(disk_read_mbps=50)  # nonzero — should light bottom
         frame = render_bars(stats, ["disk_read"] + [None] * 8)
         assert frame[0][ROWS - 1] > 0
-        assert frame[0][0] > 0
 
     def test_disk_write_bar(self):
         stats = _dummy_stats(disk_write_mbps=0)
@@ -176,6 +177,45 @@ class TestRenderBars:
         stats = _dummy_stats(temp_local_c=50)
         frame = render_bars(stats, ["temp_local"] + [None] * 8)
         assert frame[0][ROWS - 1] > 0
+
+    def test_battery_bar(self):
+        stats = _dummy_stats(battery_percent=50)
+        frame = render_bars(stats, ["battery"] + [None] * 8)
+        assert frame[0][ROWS - 1] > 0
+        assert frame[0][0] == 0    # 50% should not reach top
+
+    def test_battery_full_lights_top(self):
+        stats = _dummy_stats(battery_percent=100)
+        frame = render_bars(stats, ["battery"] + [None] * 8)
+        assert frame[0][0] > 0
+
+    def test_alert_stripe_on_high_cpu(self):
+        """Bar at alert level (>=90%) should have alternating off rows."""
+        stats = _dummy_stats(cpu_percent=95)
+        frame = render_bars(stats, ["cpu"] + [None] * 8)
+        col = frame[0]
+        lit = [v for v in col if v > 0]
+        dark_in_bar = [v for v in col[col.index(next(v for v in col if v > 0)):] if v == 0]
+        assert len(dark_in_bar) > 0, "Alert bar should have dark rows within lit region"
+
+    def test_no_alert_stripe_below_threshold(self):
+        """Bar below alert threshold should have no dark rows within lit region."""
+        stats = _dummy_stats(cpu_percent=50)
+        frame = render_bars(stats, ["cpu"] + [None] * 8)
+        col = frame[0]
+        first_lit = next((i for i, v in enumerate(col) if v > 0), None)
+        if first_lit is not None:
+            assert all(v > 0 for v in col[first_lit:]), "No stripes below threshold"
+
+    def test_battery_alert_on_low(self):
+        """Battery below 20% should show alert stripe."""
+        stats = _dummy_stats(battery_percent=15)
+        frame = render_bars(stats, ["battery"] + [None] * 8)
+        col = frame[0]
+        first_lit = next((i for i, v in enumerate(col) if v > 0), None)
+        assert first_lit is not None
+        has_dark_in_bar = any(v == 0 for v in col[first_lit:])
+        assert has_dark_in_bar, "Low battery should show stripe pattern"
 
 
 # ---------------------------------------------------------------------------
@@ -264,11 +304,11 @@ class TestRenderer:
 
     def test_default_bar_slots_is_all_stats(self):
         r = Renderer(mode="bars")
-        # Default comes from ALL_STAT_KEYS; with 11 keys the list is 11 items
         assert r.bar_slots == list(ALL_STAT_KEYS)
         assert "disk" in r.bar_slots
         assert "disk_read" in r.bar_slots
         assert "disk_write" in r.bar_slots
+        assert "battery" in r.bar_slots
 
     def test_custom_bar_slots(self):
         slots = ["cpu", None, "ram"] + [None] * 6

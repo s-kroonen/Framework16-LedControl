@@ -49,6 +49,10 @@ def main() -> None:
     from led_control.config import Config
     from led_control.service import ServiceLoop
     from led_control.tray import TrayIcon
+    from led_control import startup
+
+    # Ensure a Start Menu shortcut exists so the app can be relaunched after exit
+    startup.create_start_menu_shortcut()
 
     # Load config, apply CLI overrides
     config = Config()
