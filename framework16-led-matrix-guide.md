@@ -1,552 +1,249 @@
-# Claude Code Guide: Framework 16 LED Matrix System Monitor
+# Framework 16 LED Matrix — Developer Reference
 
-A step-by-step guide for using Claude Code to build a lightweight Windows background process
-that displays CPU, RAM, and disk usage on the Framework 16 LED matrix input module, with a
-system tray icon for live control.
+Technical reference for the Framework 16 LED matrix input module and this project's implementation.
 
 ---
 
-## Prerequisites
+## Hardware
 
-Before opening Claude Code, have the following ready:
+- **Module**: Framework 16 LED Matrix Input Module
+- **Interface**: USB CDC-ACM virtual serial port (115200 baud)
+- **USB IDs**: VID `0x32AC` PID `0x0020`
+- **Matrix size**: 9 columns × 34 rows
+- **Brightness**: 0–255 per LED
 
-- Python 3.10+ installed (add to PATH during install)
-- Framework 16 with LED matrix input module inserted
-- The COM port your matrix is on (check Device Manager → Ports)
-- Claude Code installed and authenticated
-
----
-
-## Project overview
-
-What you are building:
-
-```
-matrix-monitor/
-├── main.py            # Entry point — starts threads, launches tray icon
-├── poller.py          # psutil stats collection thread
-├── renderer.py        # Converts stats into 9×34 LED frames
-├── tray.py            # pystray system tray icon and right-click menu
-├── config.py          # Loads and saves config.json
-├── modes/
-│   ├── __init__.py
-│   ├── bar_chart.py   # Vertical bar chart per stat
-│   ├── rolling_graph.py  # Scrolling history graph
-│   └── text_scroll.py    # Scrolling text readout
-├── config.json        # User settings (auto-created on first run)
-├── icon.png           # 64×64 tray icon image
-├── requirements.txt
-└── build.bat          # PyInstaller build script
-```
+The COM port assigned by Windows varies. The app auto-detects the matrix by VID/PID in `led_driver.py`; a fallback manual port can be set in `%APPDATA%\LedControl\config.json` under `serial_port`.
 
 ---
 
-## Step 1 — Start the project
+## LED Protocol
 
-Open a terminal in an empty folder and start Claude Code:
+The matrix uses a **StageCol + FlushCols** protocol over the CDC-ACM connection.
 
-```bash
-mkdir matrix-monitor
-cd matrix-monitor
-claude
+1. **StageCol** — send the brightness values for one column (34 bytes)
+2. **FlushCols** — commit all staged columns to the display in one atomic update
+
+Full protocol details and command byte definitions are in the [framework-system](https://github.com/FrameworkComputer/framework-system) repository.
+
+The project's wrapper is in `led_control/led_driver.py`:
+
+```python
+driver = LedDriver(port="COM3")   # or port=None to auto-detect
+driver.connect()
+driver.draw_frame(frame)          # frame[col][row], values 0–255
+driver.sleep(True)                # blank the matrix without disconnecting
+driver.clear()                    # zero all LEDs
+driver.disconnect()
 ```
 
-Paste this prompt:
+The driver retries on disconnect with exponential backoff (1 s → 60 s max) managed by the service loop.
 
-```
-Create a new Python project called matrix-monitor. Set up the folder structure below, create
-a requirements.txt with these dependencies, and create a minimal main.py that just prints
-"Matrix Monitor starting..." then exits cleanly.
+---
 
-Folder structure:
-matrix-monitor/
-├── main.py
-├── poller.py
-├── renderer.py
-├── tray.py
-├── config.py
-├── modes/
-│   ├── __init__.py
-│   ├── bar_chart.py
-│   ├── rolling_graph.py
-│   └── text_scroll.py
-├── config.json
-└── requirements.txt
+## Frame Format
 
-requirements.txt contents:
-framework16_inputmodule
-psutil
-pystray
-Pillow
-pyserial
-pyinstaller
+A frame is a Python `list[list[int]]` with shape `[COLS][ROWS]` = `[9][34]`.
 
-Create all files as empty stubs with a single-line docstring describing what each file does.
+- `frame[col][row]` — brightness 0–255
+- `col 0` = leftmost column, `col 8` = rightmost
+- `row 0` = top of matrix, `row 33` = bottom
+- Bars fill from the **bottom up** (row 33 first)
+
+```python
+from led_control.renderer import Frame, COLS, ROWS
+
+frame: Frame = [[0] * ROWS for _ in range(COLS)]
+frame[0][33] = 200   # bottom pixel of leftmost column
 ```
 
 ---
 
-## Step 2 — Config system
-
-Prompt:
+## Project Architecture
 
 ```
-Implement config.py. It should:
-
-1. Define a DEFAULT_CONFIG dict with these keys:
-   - "com_port": "COM3"
-   - "mode": "bar_chart"
-   - "stats": ["cpu", "ram", "disk"]
-   - "update_interval": 2
-   - "brightness": 120
-   - "scroll_speed": 2
-
-2. Provide a load() function that reads config.json from the same directory as config.py.
-   If the file does not exist, write the defaults and return them.
-   If a key is missing from the file, fill it in from defaults and save the merged result.
-
-3. Provide a save(data: dict) function that writes config.json with indent=2.
-
-4. Provide a get() function that returns the current loaded config as a dict.
-
-5. Call load() at module import time so config is always ready.
-
-Keep it simple — no classes needed, just module-level functions and a module-level _config dict.
+main.py              — entry point; starts daemon thread + pystray loop
+led_control/
+  service.py         — background loop: collect → render → push (daemon thread)
+  tray.py            — system tray icon + context menu (pystray, main thread)
+  led_driver.py      — CDC-ACM serial driver with reconnect logic
+  stats.py           — SystemStats dataclass + StatsCollector
+  renderer.py        — SystemStats → Frame; display modes, alert logic
+  config.py          — %APPDATA%\LedControl\config.json wrapper
+  startup.py         — Windows run-on-boot registry + Start Menu shortcut
+tests/
+  test_renderer.py   — rendering unit tests (pytest)
 ```
+
+### Thread model
+
+| Thread | What it does |
+|--------|-------------|
+| Main (pystray) | Drives the tray icon event loop; puts commands into the queue |
+| LedServiceLoop (daemon) | Ticks on `cfg.tick_interval`; reads queue, collects stats, renders, sends frame |
+
+The two threads share only a `queue.Queue[str]` (commands tray → service) and the `Config` object. The service thread calls `pythoncom.CoInitialize()` at startup so WMI calls work from it.
 
 ---
 
-## Step 3 — Stats poller
+## Configuration
 
-Prompt:
+Stored at `%APPDATA%\LedControl\config.json`. Accessed via `Config` attributes:
 
-```
-Implement poller.py. It should:
-
-1. Import psutil and threading.
-
-2. Define a module-level dict called STATS with keys:
-   "cpu", "ram", "disk", "net_up", "net_down"
-   All values default to 0.0.
-
-3. Define a _poll() function that runs in a loop:
-   - Read CPU percent (interval=None, non-blocking)
-   - Read RAM percent from psutil.virtual_memory()
-   - Read disk percent from psutil.disk_usage('/')
-   - Read network bytes sent/received using psutil.net_io_counters(), calculate MB/s delta
-     between polls (store previous values as module-level vars)
-   - Update STATS with the new values
-   - Sleep for config.get()["update_interval"] seconds
-
-4. Define a start() function that launches _poll() in a daemon thread (daemon=True so it
-   dies when the main process exits).
-
-5. The poller must never crash — wrap the loop body in try/except and log errors to stderr.
-```
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `mode` | str | `"bars"` | Display mode |
+| `bar_slots` | list[str\|null] | 9 defaults | Stat key per column, or null |
+| `brightness` | int | `180` | LED brightness ceiling 0–255 |
+| `link_screen_brightness` | bool | `false` | Scale matrix brightness with screen |
+| `tick_interval` | float | `1.0` | Seconds between frames |
+| `start_on_boot` | bool | `false` | Register in Windows startup |
+| `serial_port` | str\|null | `null` | Force a COM port (null = auto-detect) |
+| `auto_off_battery_saver` | bool | `false` | Sleep matrix when Battery Saver is on |
+| `alert_mode` | str | `"stripe"` | Threshold alert style |
 
 ---
 
-## Step 4 — Display modes
+## Stat Keys
 
-### Bar chart mode
+All 14 keys are defined in `config.ALL_STAT_KEYS` and map to fields of `stats.SystemStats`.
 
-Prompt:
+| Key | Field | Notes |
+|-----|-------|-------|
+| `cpu` | `cpu_percent` | psutil, non-blocking |
+| `ram` | `ram_percent` | psutil virtual_memory |
+| `gpu` | `gpu_percent` | LHM iGPU load; falls back to GPUtil dGPU |
+| `gpu_vram` | `gpu_vram_percent` | GPUtil only; 0 without dGPU |
+| `disk` | `disk_percent` | I/O busy % (Task Manager style) |
+| `disk_read` | `disk_read_mbps` | Dynamic ceiling via RollingMax |
+| `disk_write` | `disk_write_mbps` | Dynamic ceiling via RollingMax |
+| `net_rx` | `net_recv_mbps` | Mbit/s, dynamic ceiling |
+| `net_tx` | `net_sent_mbps` | Mbit/s, dynamic ceiling |
+| `battery` | `battery_percent` | psutil; 100 when on AC |
+| `cpu_temp` | `cpu_temp_c` | LHM: F75303_CPU or CPU Package |
+| `temp_ddr` | `temp_ddr_c` | LHM: F75303_DDR |
+| `temp_local` | `temp_local_c` | LHM: F75303_Local |
+| `gpu_temp` | `gpu_temp_c` | LHM: dGPU AMB; 0 if no dGPU |
 
-```
-Implement modes/bar_chart.py.
-
-The Framework 16 LED matrix is 9 columns wide and 34 rows tall (9×34).
-A "frame" is a list of 34 lists, each containing 9 brightness values (0–255).
-
-Implement a render(stats: dict) -> list function that:
-
-1. Takes the STATS dict from poller.py (keys: cpu, ram, disk, net_up, net_down).
-2. Reads config.get()["stats"] to know which stats to show (e.g. ["cpu", "ram", "disk"]).
-3. Divides the 9 columns evenly across the active stats, with a 1-column gap between each bar.
-4. For each stat:
-   - Calculate bar height as int(value / 100 * 34) pixels from the bottom.
-   - Fill those pixels with brightness 200.
-   - Fill the remaining pixels above with brightness 0.
-5. Returns the completed 34×9 frame as a list of lists.
-
-If fewer than 3 stats are selected, center the bars horizontally.
-Handle division by zero if stats list is empty by returning a blank frame.
-```
-
-### Rolling graph mode
-
-Prompt:
-
-```
-Implement modes/rolling_graph.py.
-
-It should maintain a rolling history buffer of the last 34 readings for each active stat.
-Use collections.deque(maxlen=34) per stat.
-
-Implement:
-1. update(stats: dict) — appends the current values to each stat's deque.
-2. render(stats: dict) -> list — builds a 34×9 frame where:
-   - Each column (left to right) represents one time step, oldest on the left.
-   - The 9 rows are split vertically between active stats (e.g. 3 stats = 3 rows each).
-   - Within each stat's row band, illuminate pixels from the bottom up proportional to the
-     stat value (0–100% maps to 0–band_height pixels), brightness 220.
-   - A single bright pixel (brightness 255) marks the top of each bar as a peak indicator.
-   - Unused pixels are 0.
-
-Import update() and call it every render cycle from renderer.py.
-```
-
-### Text scroll mode
-
-Prompt:
-
-```
-Implement modes/text_scroll.py.
-
-The LED matrix is 9 wide × 34 tall and is oriented vertically (portrait).
-Text should scroll upward from the bottom.
-
-Implement a simple 5×3 pixel bitmap font for digits 0–9 and the characters:
-C R A M D I S K % . space
-
-Define each character as a list of 5 rows, each row a list of 3 column bits (1=on, 0=off).
-
-Implement:
-1. build_message(stats: dict) -> str — formats a string like "CPU 45% RAM 61% DSK 23%"
-   using only the active stats from config.
-2. render(stats: dict) -> list — returns a 34×9 frame showing the message scrolling upward.
-   Use a module-level scroll_offset that increments by config["scroll_speed"] pixels per call.
-   Reset when the message has fully scrolled past.
-   Center the text horizontally in the 9-column grid.
-   Brightness for lit pixels: 200.
-```
+**Temperature and iGPU load** require [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor) or Open Hardware Monitor running. The sensor reader connects to their WMI namespace (`root\LibreHardwareMonitor` or `root\OpenHardwareMonitor`) at startup on the service thread.
 
 ---
 
-## Step 5 — Frame renderer
+## Display Modes
 
-Prompt:
+| Mode | Render function | Description |
+|------|----------------|-------------|
+| `bars` | `render_bars()` | 9 vertical bar graphs from `cfg.bar_slots` |
+| `cpu_cores` | `render_cpu_cores()` | One bar per logical core, merged into 9 buckets |
+| `clock` | `render_clock()` | HH:MM using 4×7 bitmap font, blinking separator |
+| `breathe` | `render_breathe()` | Full-matrix sine-wave breathing pulse |
 
-```
-Implement renderer.py.
-
-This module bridges the display modes and the hardware.
-
-1. Import framework16_inputmodule and each mode from the modes/ package.
-
-2. Define a connect(com_port: str) function that opens a serial connection to the LED matrix
-   using framework16_inputmodule. Store the connection as a module-level variable.
-   Return True on success, False on failure (log the error, do not crash).
-
-3. Define a send_frame(frame: list) function that sends a 34×9 brightness frame to the matrix.
-   The frame is a list of 34 rows × 9 columns, values 0–255.
-   Use the framework16_inputmodule API to send the full frame in one call.
-
-4. Define a render_loop() function that runs in a loop:
-   - Read config["mode"] to pick the active mode module.
-   - Call that mode's render(stats) with poller.STATS.
-   - Call send_frame() with the result.
-   - Sleep for config["update_interval"] seconds.
-   - Wrap in try/except — on serial error, attempt reconnect once then continue.
-
-5. Define a start() function that calls connect() then launches render_loop() in a daemon thread.
-
-6. Define a set_brightness(value: int) function that sends a brightness command (0–255)
-   to the matrix immediately.
-```
+The active mode is stored in `cfg.mode` and dispatched in `Renderer.render()`.
 
 ---
 
-## Step 6 — System tray icon
+## Alert System
 
-Prompt:
+When a metric meets or exceeds its threshold, the column shows a visual warning pattern. Thresholds are in `renderer._ALERT_THRESHOLDS`.
 
-```
-Implement tray.py using pystray and Pillow.
+| Key | Threshold | Direction |
+|-----|-----------|-----------|
+| `cpu`, `ram`, `gpu`, `gpu_vram`, `disk` | 90 % | ≥ |
+| `disk_read`, `disk_write` | 200 MB/s | ≥ |
+| `net_rx`, `net_tx` | 100 Mbit/s | ≥ |
+| `cpu_temp`, `gpu_temp` | 85 °C | ≥ |
+| `temp_ddr` | 70 °C | ≥ |
+| `temp_local` | 60 °C | ≥ |
+| `battery` | 20 % | **≤** (low battery) |
 
-1. Generate a simple 64×64 tray icon programmatically using Pillow:
-   - Dark background (#1a1a2e)
-   - A 3×5 grid of small white squares representing the LED matrix
-   - Save it as icon.png next to the script on first run if it does not exist.
+| Alert mode | Visual |
+|------------|--------|
+| `none` | Normal solid bar |
+| `stripe` | Alternating lit/dark rows within the bar |
+| `stripe_blink` | Alternates striped ↔ solid each frame |
+| `bar_blink` | Alternates solid ↔ dark each frame |
 
-2. Build a pystray.Icon with a right-click menu containing:
-
-   "Matrix Monitor"        ← title, disabled
-   ─────────────────
-   Mode ►
-     ● Bar chart
-       Rolling graph
-       Text scroll
-   ─────────────────
-   Stats ►
-     ✓ CPU
-     ✓ RAM
-     ✓ Disk
-       Network up
-       Network down
-   ─────────────────
-   Brightness ►
-     Low (60)
-     Medium (120)
-     High (200)
-     Max (255)
-   ─────────────────
-   Update interval ►
-     Fast (1s)
-     Normal (2s)
-     Slow (5s)
-   ─────────────────
-   Open config file
-   ─────────────────
-   Quit
-
-3. Each menu action should update config via config.save() and take effect on the next
-   render cycle — no restart needed.
-
-4. "Open config file" should open config.json in the default text editor using os.startfile().
-
-5. Define a start(on_quit_callback) function that runs icon.run() — this is blocking and
-   must be called from the main thread.
-
-6. Checked items (active mode, enabled stats, current brightness, current interval) should
-   reflect the current config when the menu is opened. Use pystray's checked= parameter.
-```
+Blink is frame-count based (`Renderer._render_count % 2`) to avoid aliasing with the 1 s tick.
 
 ---
 
-## Step 7 — Main entry point
+## Battery Saver Detection
 
-Prompt:
+`stats.get_battery_saver()` reads:
 
-```
-Implement main.py as the application entry point.
+1. **Registry** (primary): `HKLM\SYSTEM\CurrentControlSet\Control\Power\EnergySaverState`
+   - `1` = Battery Saver active → returns `True`
+   - `2` = configured but inactive
+   - `0` = disabled
+2. **GetSystemPowerStatus** (fallback): `SystemStatusFlag & 1`
 
-1. Import config, poller, renderer, tray.
-
-2. In a main() function:
-   a. Call config.load() (already called at import, but call explicitly for clarity).
-   b. Print the loaded COM port and mode to stderr for debugging.
-   c. Call poller.start() to begin collecting stats in the background.
-   d. Call renderer.start() to begin sending frames to the matrix.
-   e. Call tray.start(on_quit) where on_quit calls sys.exit(0).
-
-3. The call to tray.start() is blocking — it runs the pystray main loop on the main thread.
-   Everything else runs in daemon threads.
-
-4. Wrap main() in if __name__ == "__main__": and catch KeyboardInterrupt gracefully.
-
-5. Use pythonw.exe compatibility — do not write to stdout (pystray on Windows silently drops
-   stdout). Use stderr for all debug output, or a simple log file.
-```
+`GetSystemPowerStatus.SystemStatusFlag` returns `0` on Windows 11 Framework hardware even when Battery Saver is active, so the registry key is authoritative.
 
 ---
 
-## Step 8 — Test the full loop
+## Dynamic Bar Ceilings
 
-Prompt:
+Rate metrics (`disk_read`, `disk_write`, `net_rx`, `net_tx`) use a `RollingMax` tracker so the bar always uses most of its vertical range:
 
-```
-The project is now structurally complete. Help me test it step by step.
+- New peak → ceiling jumps immediately
+- Quiet period → ceiling decays toward the minimum floor at ~1.5 %/s (half-life ≈ 45 s)
 
-1. First, verify I can import everything without errors:
-   python -c "import config; import poller; import renderer; import tray; print('All imports OK')"
-
-2. Check that config.json was created with defaults. Show me its contents.
-
-3. Test the poller in isolation — write a quick inline test that starts the poller, waits 3
-   seconds, and prints the STATS dict.
-
-4. Test the serial connection separately — write a snippet that connects to the COM port from
-   config.json, sends a blank frame (all zeros), then sends a full-brightness frame, and
-   disconnects. This confirms the hardware path works before running the full app.
-
-5. If any step fails, diagnose the error and fix it.
-```
+This means a burst of disk activity stretches the bar to fill the column, then the ceiling slowly retreats as activity drops.
 
 ---
 
-## Step 9 — Windows startup integration
+## Adding a Display Mode
 
-Prompt:
+See `CLAUDE.md` → *How to Add a New Display Mode* for step-by-step instructions.
 
-```
-Add Windows startup support. Create two files:
-
-1. install_startup.py — a script the user runs once that registers matrix-monitor to start
-   with Windows using Task Scheduler (schtasks). It should:
-   - Find the path to pythonw.exe automatically using sys.executable.
-   - Find the absolute path to main.py.
-   - Run a schtasks /create command that:
-     * Triggers on user logon
-     * Runs pythonw.exe with main.py as the argument
-     * Task name: "Framework Matrix Monitor"
-     * Run whether user is logged in or not: no (interactive only)
-     * Hidden: yes (no console window)
-   - Print success or error.
-   - Require no admin rights (use /sc onlogon /ru currentuser).
-
-2. uninstall_startup.py — removes the task with schtasks /delete.
-
-Also create a run_silent.vbs as an alternative startup method for users who prefer the
-Startup folder approach over Task Scheduler:
-
-   CreateObject("WScript.Shell").Run "pythonw.exe ""C:\path\to\main.py""", 0, False
-
-With a comment explaining the user must edit the path.
-```
+Short version: write `render_mymode()` in `renderer.py`, add the name to `MODES`, add a branch in `Renderer.render()`, add a tray `Item` in `tray._menu_items()`.
 
 ---
 
-## Step 10 — Build a standalone executable
+## Adding a Stat Key
 
-Prompt:
+See `CLAUDE.md` → *How to Add a New Stat / Custom Screen Column* for step-by-step instructions.
 
-```
-Create build.bat — a Windows batch script that uses PyInstaller to compile the project into
-a single .exe with no console window.
-
-The command should:
-- Use --onefile to produce a single matrix-monitor.exe
-- Use --noconsole (equivalent to --windowed) so no terminal appears
-- Use --name "matrix-monitor"
-- Include config.json and icon.png as data files with --add-data
-- Set the icon to icon.png with --icon
-- Output to a dist/ folder
-
-Also write a brief comment at the top of the .bat explaining that the user should run this
-from the project root after activating their virtual environment.
-
-After building, show the user the command to run the exe and verify it appears in the
-system tray.
-```
+Short version: add field to `SystemStats`, collect it in `StatsCollector.collect()`, register key + label in `config.py`, map it in `renderer._stat_to_column()`.
 
 ---
 
-## Step 11 — Polish and error handling
+## Troubleshooting
 
-Prompt:
+**Matrix not detected**
 
-```
-Review the entire project for robustness. Fix or add the following:
+Check Device Manager → Ports for a COM port with VID 32AC / PID 0020. If it shows as an unknown device, install the Framework CDC-ACM driver. Force the port with `"serial_port": "COM5"` in config.json.
 
-1. If the COM port in config.json does not exist or the matrix is disconnected, the renderer
-   should retry the connection every 10 seconds instead of crashing. Show a tooltip on the
-   tray icon: "Matrix disconnected — retrying...".
+**Temperature stats show 0**
 
-2. If psutil cannot read disk usage on '/' (Windows uses drive letters), fall back to
-   psutil.disk_usage('C:/').
+LibreHardwareMonitor or Open Hardware Monitor must be running. Start it, let it scan sensors once, then restart the LED app. The service thread re-attempts WMI connection at startup only.
 
-3. Add a --com-port CLI argument to main.py so the user can override the config port:
-   pythonw.exe main.py --com-port COM5
+**iGPU load shows 0 despite LHM running**
 
-4. Add a simple rotating log file (max 1 MB, 1 backup) using Python's logging module.
-   Log to matrix-monitor.log in the same directory as main.py.
-   Replace all print/stderr calls with logger calls.
+The sensor name varies by driver version. Check LHM's sensor list for names containing "GPU". Add the exact name to `TempSensorReader._LOAD_CANDIDATES["gpu_percent"]` in `stats.py`.
 
-5. Ensure the app handles Windows sleep/wake correctly — after a sleep event, force a
-   reconnect to the matrix (use win32api or a simple threading.Event for this).
-```
+**Battery Saver auto-off not triggering**
 
----
+Run this from a Python prompt while Battery Saver is active to verify the registry value:
 
-## Step 12 — Optional additions
-
-Once the core app works, you can extend it with these follow-up prompts:
-
-### GPU usage (NVIDIA)
-
-```
-Add GPU usage monitoring using the pynvml library (pip install pynvml).
-Add "gpu" as a supported stat in poller.py. Fall back gracefully if no NVIDIA GPU is found.
-Add "GPU" as a toggleable option in the tray Stats submenu.
+```python
+import winreg
+with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                    r"SYSTEM\CurrentControlSet\Control\Power") as k:
+    print(winreg.QueryValueEx(k, "EnergySaverState"))
+# Expected: (1, 4)
 ```
 
-### Custom mode: clock
+**High CPU usage from the app**
 
-```
-Add modes/clock.py. It should display the current time as scrolling text using the existing
-bitmap font from text_scroll.py. Format: "HH:MM" using a colon character (add the colon to
-the font if missing). This mode does not need poller.STATS — it reads datetime.now() directly.
-Register it in renderer.py and add "Clock" to the tray Mode submenu.
-```
+Increase `tick_interval` in config.json (e.g. `2.0`). The service thread's 50 ms idle sleep is intentional to keep command latency low; the stat collection itself is the main cost.
 
-### Settings GUI
+**pystray menu item throws ValueError**
 
-```
-Add a simple settings window using tkinter (built into Python, no extra install).
-Accessible from a "Settings..." tray menu item. It should show:
-- COM port dropdown (auto-populated by scanning available serial ports with serial.tools.list_ports)
-- Mode selector (radio buttons)
-- Stats checkboxes
-- Brightness slider (0–255)
-- Update interval radio buttons
-A "Save" button writes to config.json and closes the window.
-A "Save & Apply" button does the same and immediately updates the running renderer.
-```
+pystray's `_assert_action` rejects any callable that has parameters beyond `(icon, item)`. Do not use lambdas with default keyword arguments (`lambda icon, item, x=val: ...`). Use a factory method instead:
 
-### Dual matrix support
-
-```
-The Framework 16 can have two LED matrix modules (left and right input bays).
-Update renderer.py to support two simultaneous connections.
-Add config keys "com_port_left" and "com_port_right".
-Add a tray option "Dual matrix mode" that, when enabled, mirrors the frame to both matrices
-or shows different stats on each (left = CPU/RAM, right = disk/network).
-```
-
----
-
-## Troubleshooting prompts
-
-Keep these ready to paste if something goes wrong:
-
-**Serial port not found:**
-```
-The matrix is connected but Python cannot find it. Help me list all available serial ports
-using serial.tools.list_ports and match the Framework LED matrix by its USB VID:PID
-(0x32AC:0x0020). Update config.py to auto-detect the port if com_port is set to "auto".
-```
-
-**Tray icon not appearing:**
-```
-The pystray icon is not showing in the Windows system tray. Check whether the icon image is
-valid (64×64 RGB PNG), whether pystray.Icon.run() is being called from the main thread, and
-whether any exception is being swallowed silently. Add explicit error logging around the
-tray setup.
-```
-
-**High CPU usage:**
-```
-The monitor itself is using too much CPU. Profile it — add a simple elapsed-time log to the
-render loop and identify whether the bottleneck is psutil polling, frame rendering, or serial
-writes. Suggest fixes: increase the update interval, reduce serial write frequency if the
-frame has not changed, or move the network delta calculation off the hot path.
-```
-
-**PyInstaller missing modules:**
-```
-The compiled .exe crashes with ModuleNotFoundError for framework16_inputmodule or pystray.
-Add the missing packages as hidden imports in the PyInstaller command using --hidden-import.
-List the exact flags needed.
-```
-
----
-
-## Final checklist
-
-Before shipping, ask Claude Code to verify:
-
-```
-Run through this checklist and fix anything that fails:
-
-[ ] python main.py starts without errors and the tray icon appears
-[ ] Right-clicking the tray icon shows the full menu
-[ ] Switching modes updates the matrix on the next cycle
-[ ] Disconnecting the matrix USB and reconnecting recovers automatically
-[ ] install_startup.py registers the task and it survives a reboot
-[ ] The compiled .exe runs without a Python install present
-[ ] config.json is created automatically on first run
-[ ] The log file is created at matrix-monitor.log
-[ ] CPU usage of the monitor process is under 1% at steady state
-[ ] Memory usage is under 50 MB
+```python
+def _my_cb(self, val):
+    def cb(icon, item):
+        self._send(f"cmd:{val}")
+    return cb
 ```
