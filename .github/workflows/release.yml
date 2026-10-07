@@ -139,6 +139,30 @@ jobs:
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}  # v1.0.0-beta → pre-release
           generate_release_notes: true
+          body: |
+            ## Install
+
+            ### Windows
+            Download **`LedMatrixControl-windows-x64.exe`** and double-click to run.
+            The app starts silently in the system tray — no installer needed.
+            Enable **Start on boot** from the tray menu to persist across reboots.
+            For CPU/DDR temperatures and iGPU load, also run [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor) in the background.
+
+            ### Linux (Fedora / Ubuntu / Debian — x64)
+            ```bash
+            # 1. Allow serial port access (log out and back in after this)
+            sudo usermod -aG dialout $USER
+
+            # 2. Make executable and run
+            chmod +x LedMatrixControl-linux-x64
+            ./LedMatrixControl-linux-x64
+            ```
+            GNOME users: install the [AppIndicator extension](https://extensions.gnome.org/extension/615/appindicator-support/) for the tray icon.
+            For temperature sensors, install `lm-sensors` and run `sudo sensors-detect --auto`.
+
+            See **[INSTALL.md](INSTALL.md)** for full instructions including autostart, uninstall, and per-distro package names.
+
+            ---
           files: |
             dist/LedMatrixControl-windows-x64.exe
             dist/LedMatrixControl-linux-x64
