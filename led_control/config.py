@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 from pathlib import Path
 from typing import Any, Optional
 
@@ -99,8 +100,11 @@ _DEFAULTS: dict[str, Any] = {
 
 
 def _config_dir() -> Path:
-    appdata = os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming"
-    return Path(appdata) / _APP_NAME
+    if sys.platform == "win32":
+        appdata = os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming"
+        return Path(appdata) / _APP_NAME
+    xdg = os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")
+    return Path(xdg) / _APP_NAME
 
 
 def _config_path() -> Path:

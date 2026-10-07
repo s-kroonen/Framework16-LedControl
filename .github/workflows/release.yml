@@ -1,0 +1,144 @@
+name: Build & Release
+
+# Triggers:
+#   push of a version tag  →  full build + GitHub Release
+#   push to master / PR    →  tests only (no binaries)
+on:
+  push:
+    tags:
+      - "v*.*.*"
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+
+jobs:
+  # -------------------------------------------------------------------------
+  # Run the test suite on both platforms on every push / PR
+  # -------------------------------------------------------------------------
+  test:
+    name: Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # lm-sensors needed so psutil.sensors_temperatures() doesn't error
+      - name: Install system deps (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y lm-sensors
+
+      - name: Run tests
+        run: python -m pytest tests/ -v
+
+  # -------------------------------------------------------------------------
+  # Build binaries — only on a version tag, after tests pass
+  # -------------------------------------------------------------------------
+  build:
+    name: Build (${{ matrix.os }})
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            artifact_name: LedMatrixControl.exe
+            asset_name: LedMatrixControl-windows-x64.exe
+          - os: ubuntu-latest
+            artifact_name: LedMatrixControl
+            asset_name: LedMatrixControl-linux-x64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyinstaller
+
+      # GTK and AppIndicator libraries required by pystray on Linux
+      - name: Install system deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            lm-sensors \
+            libgirepository1.0-dev \
+            gir1.2-ayatanaappindicator3-0.1 \
+            python3-gi
+
+      - name: Build with PyInstaller
+        run: pyinstaller led_control.spec
+
+      - name: Rename binary (Linux)
+        if: runner.os == 'Linux'
+        run: mv dist/LedMatrixControl dist/${{ matrix.asset_name }}
+
+      - name: Rename binary (Windows)
+        if: runner.os == 'Windows'
+        run: Rename-Item dist\LedMatrixControl.exe ${{ matrix.asset_name }}
+        shell: pwsh
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: dist/${{ matrix.asset_name }}
+
+  # -------------------------------------------------------------------------
+  # Create a GitHub Release and attach both binaries
+  # -------------------------------------------------------------------------
+  release:
+    name: GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write   # needed to create a release
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Windows binary
+        uses: actions/download-artifact@v4
+        with:
+          name: LedMatrixControl-windows-x64.exe
+          path: dist/
+
+      - name: Download Linux binary
+        uses: actions/download-artifact@v4
+        with:
+          name: LedMatrixControl-linux-x64
+          path: dist/
+
+      - name: Make Linux binary executable
+        run: chmod +x dist/LedMatrixControl-linux-x64
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}  # v1.0.0-beta → pre-release
+          generate_release_notes: true
+          files: |
+            dist/LedMatrixControl-windows-x64.exe
+            dist/LedMatrixControl-linux-x64

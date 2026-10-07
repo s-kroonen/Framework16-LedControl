@@ -2,6 +2,11 @@ psutil>=5.9
 pyserial>=3.5
 pystray>=0.19
 Pillow>=10.0
-pywin32>=306
-WMI>=1.5
 pytest>=7.0
+
+# Windows only
+pywin32>=306; sys_platform=="win32"
+WMI>=1.5; sys_platform=="win32"
+
+# Optional: NVIDIA dGPU support (all platforms)
+# GPUtil>=1.4

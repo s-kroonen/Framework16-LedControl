@@ -3,17 +3,14 @@ System metric collectors.
 
 Temperature sensors
 ───────────────────
-Temperature reading requires LibreHardwareMonitor or Open Hardware Monitor
-to be running.  The service connects to their WMI namespace at startup and
-maps sensor names to stat keys:
+Windows:
+  Requires LibreHardwareMonitor or Open Hardware Monitor running.
+  Connects to their WMI namespace and maps sensor names to stat keys.
 
-  cpu_temp   ← F75303_CPU  (APU die, most accurate)
-  temp_ddr   ← F75303_DDR  (memory temperature)
-  temp_local ← F75303_Local (ambient near F75303 chip)
-  gpu_temp   ← dGPU AMB / GPU Core (zero if no dGPU installed)
-
-iGPU load is also read from LibreHardwareMonitor / OHM when available.
-Without a hardware monitor running, temperature and iGPU stats return 0.
+Linux:
+  Reads directly from psutil.sensors_temperatures() (kernel hwmon).
+  iGPU busy % is read from /sys/class/drm/card*/device/gpu_busy_percent
+  (AMD only; returns 0 on Intel/NVIDIA without extra tooling).
 
 Disk metrics
 ────────────
@@ -27,14 +24,16 @@ Battery
 
 Battery saver
 ─────────────
-  get_battery_saver()  Returns True when Windows Battery Saver is active.
+  get_battery_saver()  Returns True when the system's power-saving mode is active.
+  Windows: reads HKLM EnergySaverState registry key.
+  Linux:   reads power-profiles-daemon active profile ("power-saver") via D-Bus,
+           falling back to upower's "PowerSaveMode" property.
 """
 
 from __future__ import annotations
 
-import ctypes
-import ctypes.wintypes
 import logging
+import sys
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -43,32 +42,44 @@ import psutil
 
 log = logging.getLogger(__name__)
 
+_IS_WINDOWS = sys.platform == "win32"
+
 try:
     import GPUtil  # type: ignore
     _GPUTIL_AVAILABLE = True
 except ImportError:
     _GPUTIL_AVAILABLE = False
 
-try:
-    import wmi  # type: ignore
-    _WMI_AVAILABLE = True
-except Exception:
+if _IS_WINDOWS:
+    try:
+        import wmi  # type: ignore
+        _WMI_AVAILABLE = True
+    except Exception:
+        _WMI_AVAILABLE = False
+else:
     _WMI_AVAILABLE = False
 
 
 # ---------------------------------------------------------------------------
-# Battery saver detection  (Windows only, zero-dependency)
+# Battery saver / power-save mode detection
 # ---------------------------------------------------------------------------
 
 def get_battery_saver() -> bool:
-    """Return True if Windows Battery Saver mode is currently active.
+    """Return True if the system's power-saving mode is currently active.
 
-    On Windows 11, GetSystemPowerStatus.SystemStatusFlag does not reliably
-    reflect Battery Saver state. The registry key EnergySaverState is used
-    as the primary source, with the API as fallback.
+    Windows: reads EnergySaverState registry key under HKLM Control\\Power.
+             Value 1 = Battery Saver active.  GetSystemPowerStatus fallback.
+    Linux:   queries power-profiles-daemon active profile via D-Bus.
+             Falls back to reading UPower PowerSaveMode property.
     """
-    # Primary: registry key EnergySaverState under HKLM\...\Control\Power
-    # Values: 1 = Battery Saver active, 2 = configured but inactive, 0 = disabled
+    if _IS_WINDOWS:
+        return _get_battery_saver_windows()
+    return _get_battery_saver_linux()
+
+
+def _get_battery_saver_windows() -> bool:
+    import ctypes
+    # Primary: registry (GetSystemPowerStatus.SystemStatusFlag is unreliable on Win11)
     try:
         import winreg
         with winreg.OpenKey(
@@ -76,21 +87,23 @@ def get_battery_saver() -> bool:
             r"SYSTEM\CurrentControlSet\Control\Power",
         ) as key:
             val, _ = winreg.QueryValueEx(key, "EnergySaverState")
-            return val == 1
+            return val == 1   # 1=active, 2=configured but off, 0=disabled
     except FileNotFoundError:
         pass
     except Exception as exc:
         log.debug("get_battery_saver registry: %s", exc)
 
-    # Fallback: GetSystemPowerStatus (unreliable on some Windows 11 builds)
+    # Fallback: GetSystemPowerStatus
     try:
+        import ctypes.wintypes
+
         class _SPS(ctypes.Structure):
             _fields_ = [
-                ("ACLineStatus",       ctypes.c_ubyte),
-                ("BatteryFlag",        ctypes.c_ubyte),
-                ("BatteryLifePercent", ctypes.c_ubyte),
-                ("SystemStatusFlag",   ctypes.c_ubyte),
-                ("BatteryLifeTime",    ctypes.c_ulong),
+                ("ACLineStatus",        ctypes.c_ubyte),
+                ("BatteryFlag",         ctypes.c_ubyte),
+                ("BatteryLifePercent",  ctypes.c_ubyte),
+                ("SystemStatusFlag",    ctypes.c_ubyte),
+                ("BatteryLifeTime",     ctypes.c_ulong),
                 ("BatteryFullLifeTime", ctypes.c_ulong),
             ]
         s = _SPS()
@@ -102,20 +115,55 @@ def get_battery_saver() -> bool:
     return False
 
 
+def _get_battery_saver_linux() -> bool:
+    # Primary: power-profiles-daemon via D-Bus
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["gdbus", "call", "--system",
+             "--dest", "net.hadess.PowerProfiles",
+             "--object-path", "/net/hadess/PowerProfiles",
+             "--method", "org.freedesktop.DBus.Properties.Get",
+             "net.hadess.PowerProfiles", "ActiveProfile"],
+            capture_output=True, text=True, timeout=1,
+        )
+        if result.returncode == 0 and "power-saver" in result.stdout:
+            return True
+        if result.returncode == 0:
+            return False   # daemon responded — not in power-saver
+    except Exception as exc:
+        log.debug("power-profiles-daemon query: %s", exc)
+
+    # Fallback: UPower PowerSaveMode
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["gdbus", "call", "--system",
+             "--dest", "org.freedesktop.UPower",
+             "--object-path", "/org/freedesktop/UPower",
+             "--method", "org.freedesktop.DBus.Properties.Get",
+             "org.freedesktop.UPower", "PowerSaveMode"],
+            capture_output=True, text=True, timeout=1,
+        )
+        if result.returncode == 0:
+            return "true" in result.stdout.lower()
+    except Exception as exc:
+        log.debug("upower PowerSaveMode query: %s", exc)
+
+    return False
+
+
 # ---------------------------------------------------------------------------
-# Screen brightness  (WMI root\wmi — must call init_wmi_brightness() first)
+# Screen brightness
 # ---------------------------------------------------------------------------
 
 _brightness_wmi = None
 
 
 def init_wmi_brightness() -> None:
-    """
-    Create the per-thread WMI brightness connection.
-    Call once at thread start after pythoncom.CoInitialize().
-    """
+    """Windows only: create the per-thread WMI brightness connection."""
     global _brightness_wmi
-    if not _WMI_AVAILABLE:
+    if not _IS_WINDOWS or not _WMI_AVAILABLE:
         return
     try:
         _brightness_wmi = wmi.WMI(namespace="root\\wmi")
@@ -127,6 +175,12 @@ def init_wmi_brightness() -> None:
 
 def get_screen_brightness() -> Optional[int]:
     """Return current display brightness 0–100, or None."""
+    if _IS_WINDOWS:
+        return _get_brightness_windows()
+    return _get_brightness_linux()
+
+
+def _get_brightness_windows() -> Optional[int]:
     if _brightness_wmi is None:
         return None
     try:
@@ -138,30 +192,50 @@ def get_screen_brightness() -> Optional[int]:
     return None
 
 
+def _get_brightness_linux() -> Optional[int]:
+    """Read brightness from /sys/class/backlight/*/brightness."""
+    import glob
+    try:
+        paths = glob.glob("/sys/class/backlight/*/brightness")
+        if not paths:
+            return None
+        bl_dir = paths[0].rsplit("/", 1)[0]
+        with open(f"{bl_dir}/brightness") as f:
+            current = int(f.read().strip())
+        with open(f"{bl_dir}/max_brightness") as f:
+            maximum = int(f.read().strip())
+        if maximum <= 0:
+            return None
+        return round(current / maximum * 100)
+    except Exception as exc:
+        log.debug("_get_brightness_linux: %s", exc)
+    return None
+
+
 # ---------------------------------------------------------------------------
-# Hardware monitor temperature sensors
+# Temperature sensor reader
 # ---------------------------------------------------------------------------
 
 class TempSensorReader:
     """
-    Reads named temperature sensors from LibreHardwareMonitor or
-    Open Hardware Monitor via their WMI namespace.
+    Reads named temperature sensors and iGPU load.
 
-    Must call init() on the service thread after CoInitialize().
+    Windows:
+      Connects to LibreHardwareMonitor / Open Hardware Monitor WMI namespace.
+      Must call init() on the service thread after CoInitialize().
 
-    Sensor-to-stat-key mapping (first matching name wins):
-      cpu_temp   → F75303_CPU, CPU Package, CPU Tdie, Tctl/Tdie
-      temp_ddr   → F75303_DDR, T_MEM, DDR
-      temp_local → F75303_Local, Local, Ambient
-      gpu_temp   → dGPU AMB, GPU Core, GPU
+    Linux:
+      Uses psutil.sensors_temperatures() which reads kernel hwmon entries.
+      iGPU busy % is read from /sys/class/drm/card*/device/gpu_busy_percent
+      (AMD only; 0 on other hardware without extra tooling).
     """
 
+    # Windows WMI sensor name → stat key mappings
     _NAMESPACES = [
         "root\\LibreHardwareMonitor",
         "root\\OpenHardwareMonitor",
     ]
 
-    # Ordered candidate names for each Temperature sensor key
     _CANDIDATES: Dict[str, List[str]] = {
         "cpu_temp":   ["F75303_CPU", "CPU Package", "CPU Tdie", "Tctl/Tdie"],
         "temp_ddr":   ["F75303_DDR", "T_MEM", "DDR"],
@@ -169,24 +243,43 @@ class TempSensorReader:
         "gpu_temp":   ["dGPU AMB", "GPU Core", "GPU"],
     }
 
-    # Ordered candidate names for Load-type sensor keys (iGPU, etc.)
     _LOAD_CANDIDATES: Dict[str, List[str]] = {
         "gpu_percent": ["GPU Core", "GPU D3D 3D", "GPU", "D3D 3D"],
     }
 
+    # Linux psutil chip name → stat key (first matching chip label wins)
+    _LINUX_CHIP_CANDIDATES: Dict[str, List[str]] = {
+        "cpu_temp":   ["k10temp", "coretemp", "acpitz", "cpu_thermal"],
+        "temp_ddr":   ["ddr_thermal", "dimm"],
+        "temp_local": ["f75303", "nct6775", "it8"],
+        "gpu_temp":   ["amdgpu", "radeon", "nouveau"],
+    }
+
+    # Linux psutil sensor label → stat key within a chip
+    _LINUX_LABEL_CANDIDATES: Dict[str, List[str]] = {
+        "cpu_temp":   ["Tctl", "Tdie", "Package id 0", "CPU", "temp1"],
+        "temp_ddr":   ["temp1", "DDR"],
+        "temp_local": ["temp1", "Local", "Ambient"],
+        "gpu_temp":   ["edge", "junction", "temp1"],
+    }
+
     def __init__(self) -> None:
         self._wmi: Any = None
-        # stat_key -> exact sensor name in WMI (Temperature sensors)
         self._key_to_sensor: Dict[str, str] = {}
-        # stat_key -> exact sensor name in WMI (Load sensors)
         self._key_to_load_sensor: Dict[str, str] = {}
+        self._linux_ready = False
 
     def init(self) -> None:
-        """Connect to hardware monitor WMI namespace. Call on service thread."""
+        """Connect to hardware sensors. Call on service thread (Windows: after CoInitialize)."""
+        if _IS_WINDOWS:
+            self._init_windows()
+        else:
+            self._init_linux()
+
+    def _init_windows(self) -> None:
         if not _WMI_AVAILABLE:
             log.debug("TempSensorReader: wmi module not available")
             return
-
         for ns in self._NAMESPACES:
             try:
                 w = wmi.WMI(namespace=ns)
@@ -204,7 +297,6 @@ class TempSensorReader:
                     log.debug("%s: no sensors found", ns)
                     continue
 
-                # Build temperature key → sensor-name map
                 temp_mapping: Dict[str, str] = {}
                 for key, candidates in self._CANDIDATES.items():
                     for name in candidates:
@@ -212,7 +304,6 @@ class TempSensorReader:
                             temp_mapping[key] = name
                             break
 
-                # Build load key → sensor-name map
                 load_mapping: Dict[str, str] = {}
                 for key, candidates in self._LOAD_CANDIDATES.items():
                     for name in candidates:
@@ -226,9 +317,7 @@ class TempSensorReader:
                     self._key_to_load_sensor = load_mapping
                     log.info(
                         "Hardware sensors: namespace=%s  temps=%s  loads=%s",
-                        ns,
-                        list(temp_mapping.keys()),
-                        list(load_mapping.keys()),
+                        ns, list(temp_mapping.keys()), list(load_mapping.keys()),
                     )
                     return
                 else:
@@ -238,13 +327,29 @@ class TempSensorReader:
                 log.debug("TempSensorReader: cannot connect to %s: %s", ns, exc)
 
         log.info(
-            "No hardware monitor WMI namespace available.  "
-            "Install LibreHardwareMonitor or Open Hardware Monitor and "
-            "run it once to expose sensors."
+            "No hardware monitor WMI namespace available. "
+            "Install LibreHardwareMonitor or Open Hardware Monitor and run it once."
         )
 
+    def _init_linux(self) -> None:
+        temps = psutil.sensors_temperatures()
+        if not temps:
+            log.info(
+                "No temperature sensors found via psutil. "
+                "Ensure lm-sensors is installed and 'sensors-detect' has been run."
+            )
+            return
+        self._linux_ready = True
+        available_chips = list(temps.keys())
+        log.info("Linux temperature sensors available: %s", available_chips)
+
     def read(self) -> Dict[str, float]:
-        """Return {stat_key: value} for all mapped sensors (temps in °C, loads in %)."""
+        """Return {stat_key: value} for all mapped sensors (temps °C, loads %)."""
+        if _IS_WINDOWS:
+            return self._read_windows()
+        return self._read_linux()
+
+    def _read_windows(self) -> Dict[str, float]:
         if self._wmi is None:
             return {}
         try:
@@ -267,12 +372,69 @@ class TempSensorReader:
                     result[key] = load_live[name]
             return result
         except Exception as exc:
-            log.debug("TempSensorReader.read error: %s", exc)
+            log.debug("TempSensorReader._read_windows error: %s", exc)
             return {}
+
+    def _read_linux(self) -> Dict[str, float]:
+        result: Dict[str, float] = {}
+        try:
+            temps = psutil.sensors_temperatures()
+            if not temps:
+                return result
+
+            for stat_key, chip_candidates in self._LINUX_CHIP_CANDIDATES.items():
+                label_candidates = self._LINUX_LABEL_CANDIDATES.get(stat_key, ["temp1"])
+                for chip in chip_candidates:
+                    if chip not in temps:
+                        continue
+                    entries = {e.label: e.current for e in temps[chip] if e.current}
+                    # try preferred labels first
+                    for lbl in label_candidates:
+                        if lbl in entries:
+                            result[stat_key] = entries[lbl]
+                            break
+                    else:
+                        # fall back to first sensor on this chip
+                        first = next(iter(entries.values()), None)
+                        if first is not None:
+                            result[stat_key] = first
+                    if stat_key in result:
+                        break
+
+            # iGPU busy % — AMD exposes via DRM sysfs
+            gpu_pct = _read_amd_igpu_busy()
+            if gpu_pct is not None:
+                result["gpu_percent"] = gpu_pct
+
+        except Exception as exc:
+            log.debug("TempSensorReader._read_linux error: %s", exc)
+        return result
 
     @property
     def mapped_keys(self) -> List[str]:
-        return list(self._key_to_sensor.keys()) + list(self._key_to_load_sensor.keys())
+        if _IS_WINDOWS:
+            return list(self._key_to_sensor.keys()) + list(self._key_to_load_sensor.keys())
+        temps = psutil.sensors_temperatures() if self._linux_ready else {}
+        keys = []
+        for stat_key, chip_candidates in self._LINUX_CHIP_CANDIDATES.items():
+            if any(c in temps for c in chip_candidates):
+                keys.append(stat_key)
+        if _read_amd_igpu_busy() is not None:
+            keys.append("gpu_percent")
+        return keys
+
+
+def _read_amd_igpu_busy() -> Optional[float]:
+    """Read AMD iGPU busy % from DRM sysfs. Returns None if unavailable."""
+    import glob
+    try:
+        paths = glob.glob("/sys/class/drm/card*/device/gpu_busy_percent")
+        if paths:
+            with open(paths[0]) as f:
+                return float(f.read().strip())
+    except Exception:
+        pass
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -287,18 +449,18 @@ class SystemStats:
     ram_percent: float = 0.0
     ram_used_gb: float = 0.0
     ram_total_gb: float = 0.0
-    disk_percent: float = 0.0       # I/O busy %
+    disk_percent: float = 0.0
     disk_read_mbps: float = 0.0
     disk_write_mbps: float = 0.0
-    gpu_percent: float = 0.0        # iGPU load % (from LHM) or dGPU (GPUtil)
+    gpu_percent: float = 0.0
     gpu_vram_percent: float = 0.0
-    gpu_temp_c: float = 0.0         # dGPU AMB or GPU Core
-    cpu_temp_c: float = 0.0         # F75303_CPU / APU die
-    temp_ddr_c: float = 0.0         # F75303_DDR / memory
-    temp_local_c: float = 0.0       # F75303_Local / ambient
+    gpu_temp_c: float = 0.0
+    cpu_temp_c: float = 0.0
+    temp_ddr_c: float = 0.0
+    temp_local_c: float = 0.0
     net_sent_mbps: float = 0.0
     net_recv_mbps: float = 0.0
-    battery_percent: float = 100.0  # battery charge % (100 when on AC)
+    battery_percent: float = 100.0
 
 
 # ---------------------------------------------------------------------------
@@ -306,21 +468,18 @@ class SystemStats:
 # ---------------------------------------------------------------------------
 
 class StatsCollector:
-    """Collects system statistics each tick.  Call .collect()."""
+    """Collects system statistics each tick. Call .collect()."""
 
     def __init__(self) -> None:
-        # Seed CPU counters (first call always returns 0.0)
         psutil.cpu_percent(interval=None)
         psutil.cpu_percent(percpu=True, interval=None)
 
         now = time.monotonic()
 
-        # Network baseline
         net = psutil.net_io_counters()
         self._prev_net_sent = net.bytes_sent
         self._prev_net_recv = net.bytes_recv
 
-        # Disk baseline
         try:
             disk = psutil.disk_io_counters()
             self._prev_disk_read_bytes  = disk.read_bytes
@@ -336,25 +495,18 @@ class StatsCollector:
             self._disk_available = False
 
         self._prev_io_ts = now
-
-        # Hardware temperature sensors (LibreHardwareMonitor / OHM)
         self._temp_reader = TempSensorReader()
         self._temp_reader.init()
 
-    # ------------------------------------------------------------------
-    # Private helpers
-    # ------------------------------------------------------------------
-
     def _cpu(self) -> tuple[float, List[float]]:
-        return psutil.cpu_percent(interval=None), \
-               psutil.cpu_percent(percpu=True, interval=None)
+        return (psutil.cpu_percent(interval=None),
+                psutil.cpu_percent(percpu=True, interval=None))
 
     def _ram(self) -> tuple[float, float, float]:
         vm = psutil.virtual_memory()
         return vm.percent, vm.used / 1e9, vm.total / 1e9
 
     def _disk(self, dt: float) -> tuple[float, float, float]:
-        """Returns (busy_pct, read_mbps, write_mbps)."""
         if not self._disk_available or dt <= 0:
             return 0.0, 0.0, 0.0
         try:
@@ -397,10 +549,7 @@ class StatsCollector:
         self._prev_net_recv = net.bytes_recv
         return max(0.0, sent), max(0.0, recv)
 
-    # ------------------------------------------------------------------
-
     def _battery(self) -> float:
-        """Return battery charge % (0–100), or 100.0 when on AC without battery."""
         try:
             b = psutil.sensors_battery()
             if b is not None:
@@ -414,20 +563,19 @@ class StatsCollector:
         dt  = max(0.001, now - self._prev_io_ts)
         self._prev_io_ts = now
 
-        cpu, cores              = self._cpu()
+        cpu, cores               = self._cpu()
         ram_pct, ram_used, ram_total = self._ram()
-        disk_act, disk_r, disk_w     = self._disk(dt)
+        disk_act, disk_r, disk_w = self._disk(dt)
         gpu_load, gpu_vram, gpu_temp = self._gpu()
         sent, recv               = self._net(dt)
         battery                  = self._battery()
 
-        # Hardware monitor sensors (temps + iGPU load if LHM/OHM running)
         hw = self._temp_reader.read()
         cpu_temp   = hw.get("cpu_temp",    0.0)
         temp_ddr   = hw.get("temp_ddr",    0.0)
         temp_local = hw.get("temp_local",  0.0)
-        _gpu_temp  = hw.get("gpu_temp",    gpu_temp)   # prefer HW monitor
-        _gpu_load  = hw.get("gpu_percent", gpu_load)   # iGPU load from LHM
+        _gpu_temp  = hw.get("gpu_temp",    gpu_temp)
+        _gpu_load  = hw.get("gpu_percent", gpu_load)
 
         return SystemStats(
             cpu_percent     = cpu,

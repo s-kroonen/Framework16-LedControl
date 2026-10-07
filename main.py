@@ -51,7 +51,7 @@ def main() -> None:
     from led_control.tray import TrayIcon
     from led_control import startup
 
-    # Ensure a Start Menu shortcut exists so the app can be relaunched after exit
+    # Create a launcher shortcut (Start Menu on Windows, ~/.local/share/applications on Linux)
     startup.create_start_menu_shortcut()
 
     # Load config, apply CLI overrides

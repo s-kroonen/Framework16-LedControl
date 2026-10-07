@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import logging
 import queue
+import sys
 import threading
 import time
 
@@ -71,17 +72,17 @@ class ServiceLoop:
     # ------------------------------------------------------------------
 
     def _run(self) -> None:
-        # Initialise COM for this thread so WMI calls work.
-        # pythoncom is part of pywin32 and must be called once per thread.
-        try:
-            import pythoncom
-            pythoncom.CoInitialize()
-            _com_initialised = True
-        except Exception as exc:
-            log.debug("pythoncom.CoInitialize skipped: %s", exc)
-            _com_initialised = False
+        # Windows only: initialise COM for this thread so WMI calls work.
+        _com_initialised = False
+        if sys.platform == "win32":
+            try:
+                import pythoncom
+                pythoncom.CoInitialize()
+                _com_initialised = True
+            except Exception as exc:
+                log.debug("pythoncom.CoInitialize skipped: %s", exc)
 
-        # Now safe to set up WMI brightness connection on this thread.
+        # Windows only: set up WMI brightness connection on this thread.
         init_wmi_brightness()
 
         cfg = self._config
@@ -214,7 +215,7 @@ class ServiceLoop:
             driver.sleep(True)
         driver.disconnect()
 
-        if _com_initialised:
+        if _com_initialised and sys.platform == "win32":
             try:
                 import pythoncom
                 pythoncom.CoUninitialize()

@@ -1,24 +1,37 @@
 # -*- mode: python ; coding: utf-8 -*-
 # PyInstaller spec for Framework 16 LED Matrix Control
-# Build:  pyinstaller led_control.spec
+#
+# Build on Windows:  pyinstaller led_control.spec
+# Build on Linux:    pyinstaller led_control.spec
+#
+# PyInstaller always builds for the platform it runs on.
+# Output: dist/LedMatrixControl(.exe on Windows)
+
+import sys
+
+_win = sys.platform == "win32"
+
+# Platform-specific hidden imports
+_hidden = [
+    "pystray._xorg",       # always include both backends;
+    "pystray._gtk",        # PyInstaller will skip the ones that don't exist
+    "pystray._win32",
+]
+if _win:
+    _hidden += ["win32api", "win32con", "wmi", "pythoncom"]
 
 block_cipher = None
 
 a = Analysis(
-    ['main.py'],
+    ["main.py"],
     pathex=[],
     binaries=[],
     datas=[],
-    hiddenimports=[
-        'pystray._win32',
-        'win32api',
-        'win32con',
-        'wmi',
-    ],
+    hiddenimports=_hidden,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=["wmi"] if not _win else [],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,
@@ -34,18 +47,18 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name='LedMatrixControl',
+    name="LedMatrixControl",
     debug=False,
     bootloader_ignore_signals=False,
-    strip=False,
+    strip=not _win,   # strip debug symbols on Linux to reduce binary size
     upx=True,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=False,       # no console window — runs as tray app
+    console=False,    # no terminal window — runs as tray/background app
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=None,           # TODO: add .ico file path
+    icon=None,        # TODO: add .ico (Windows) or .png (Linux) path
 )
