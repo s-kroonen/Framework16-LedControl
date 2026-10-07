@@ -33,6 +33,33 @@ Tested on **Fedora 39+**, **Ubuntu 22.04+**, **Debian 12+**.
 - Framework 16 with LED Matrix Input Module inserted
 - A desktop environment with a system tray (see note below)
 
+### 0 — Running from source (developers only)
+
+Skip this if you're running the prebuilt `LedMatrixControl-linux-x64` binary — go to step 1.
+
+The tray icon needs Python's GObject bindings (`gi`) with GTK 3 and AppIndicator typelibs. `pip install pygobject` almost always fails here — it needs `meson`, a C compiler, and GTK/GObject-introspection dev headers to build from source. The practical fix is to install the bindings as system packages and let your venv see them:
+
+**Fedora:**
+```bash
+sudo dnf install python3-gobject gtk3 libappindicator-gtk3
+```
+
+**Ubuntu / Debian:**
+```bash
+sudo apt install python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1
+```
+
+Then create the venv with `--system-site-packages` so it can import the system `gi` module instead of trying to build its own:
+
+```bash
+python3 -m venv --system-site-packages .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python main.py
+```
+
+If you already created `.venv` without that flag, delete it and recreate it with the flag above — there's no way to add system-site access to an existing venv after the fact.
+
 ### 1 — Serial port access
 
 Add your user to the `dialout` group so the app can open the serial port without `sudo`:
@@ -74,7 +101,13 @@ gnome-extensions enable appindicatorsupport@rgcjonas.gmail.com
 ```
 Alternatively, open the **GNOME Extensions** app and toggle *AppIndicator and KStatusNotifierItem Support* on.
 
-**Log out and back in** after enabling for the extension to take effect.
+**Verify it's actually enabled** (installing the package does not enable it):
+```bash
+gnome-extensions info appindicatorsupport@rgcjonas.gmail.com | grep Enabled
+```
+Should print `Enabled: Yes`. If it says `No`, run the `enable` command above.
+
+**Log out and back in** after enabling for the extension to take effect — on Wayland (the GNOME default) there is no way to reload the shell without a new session.
 
 > **No tray icon after following the steps above?**
 > Run the app from a terminal — if the tray fails it prints the exact error and keeps the LED matrix running headless. You can still use it without the tray; the config file at `~/.config/LedControl/config.json` can be edited by hand.

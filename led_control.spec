@@ -13,8 +13,9 @@ _win = sys.platform == "win32"
 
 # Platform-specific hidden imports
 _hidden = [
-    "pystray._xorg",       # always include both backends;
-    "pystray._gtk",        # PyInstaller will skip the ones that don't exist
+    "pystray._appindicator",  # GNOME: only backend that actually docks
+    "pystray._xorg",          # always include all Linux backends;
+    "pystray._gtk",           # PyInstaller will skip the ones that don't exist
     "pystray._win32",
 ]
 if _win:
