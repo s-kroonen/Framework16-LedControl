@@ -48,6 +48,36 @@ from .config import ALL_STAT_KEYS, ALERT_MODES, ALERT_MODE_LABELS, STAT_LABELS, 
 log = logging.getLogger(__name__)
 
 
+def _print_tray_help() -> None:
+    """Print actionable fix instructions when the tray icon fails on Linux."""
+    import sys
+    if sys.platform == "win32":
+        return
+    print(
+        "\n"
+        "── Tray icon error ──────────────────────────────────────────────────\n"
+        "The system tray icon could not be created.\n"
+        "\n"
+        "On GNOME (including with Dash to Panel / Arc Menu) you also need the\n"
+        "AppIndicator extension:\n"
+        "\n"
+        "  Fedora:         sudo dnf install gnome-shell-extension-appindicator\n"
+        "  Ubuntu/Debian:  sudo apt install gnome-shell-extension-appindicator\n"
+        "\n"
+        "Then enable it:\n"
+        "  gnome-extensions enable appindicatorsupport@rgcjonas.gmail.com\n"
+        "  (or use the GNOME Extensions app)\n"
+        "\n"
+        "Log out and back in after enabling.\n"
+        "\n"
+        "KDE / XFCE: tray should work without extra extensions.\n"
+        "\n"
+        "Running headless for now — the LED matrix is still active.\n"
+        "────────────────────────────────────────────────────────────────────\n",
+        file=sys.stderr,
+    )
+
+
 def _make_icon_image(size: int = 64) -> Image.Image:
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
@@ -272,12 +302,7 @@ class TrayIcon:
         """Enter the pystray event loop (blocks)."""
         if pystray is None:
             log.error("pystray is not installed; tray icon unavailable")
-            import time
-            try:
-                while True:
-                    time.sleep(1)
-            except KeyboardInterrupt:
-                self._on_quit()
+            self._run_headless()
             return
 
         self._icon = pystray.Icon(
@@ -287,4 +312,19 @@ class TrayIcon:
             menu=pystray.Menu(self._menu_items),
         )
         log.info("Tray icon starting")
-        self._icon.run()
+        try:
+            self._icon.run()
+        except Exception as exc:
+            log.error("Tray icon failed to start: %s", exc)
+            _print_tray_help()
+            log.warning("Continuing without tray icon — use Ctrl+C or kill to stop")
+            self._run_headless()
+
+    def _run_headless(self) -> None:
+        """Block the main thread with no tray; Ctrl-C exits cleanly."""
+        import time
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            self._on_quit()

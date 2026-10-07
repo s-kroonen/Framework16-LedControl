@@ -49,10 +49,14 @@ The app uses a system tray icon. What you need depends on your desktop:
 
 | Desktop | What to install |
 |---------|----------------|
-| **GNOME** | `gnome-shell-extension-appindicator` — install from [extensions.gnome.org](https://extensions.gnome.org/extension/615/appindicator-support/) or your package manager, then enable it |
-| **KDE Plasma** | Nothing — system tray works out of the box |
+| **GNOME** | `gnome-shell-extension-appindicator` — see below |
+| **KDE Plasma** | Nothing — works out of the box |
 | **XFCE** | Nothing — works out of the box |
 | **Other** | Install `libayatana-appindicator` for your distro |
+
+#### GNOME — AppIndicator extension required
+
+GNOME does not support system tray icons natively. The app uses the AppIndicator protocol, which requires a separate GNOME Shell extension regardless of what other extensions you have installed. **Dash to Panel, Arc Menu, and similar extensions do not include this — you need it in addition to them.**
 
 **Fedora:**
 ```bash
@@ -62,9 +66,18 @@ sudo dnf install gnome-shell-extension-appindicator
 **Ubuntu / Debian:**
 ```bash
 sudo apt install gnome-shell-extension-appindicator
-# Then enable via GNOME Extensions app or:
+```
+
+**Enable the extension** (required after installing):
+```bash
 gnome-extensions enable appindicatorsupport@rgcjonas.gmail.com
 ```
+Alternatively, open the **GNOME Extensions** app and toggle *AppIndicator and KStatusNotifierItem Support* on.
+
+**Log out and back in** after enabling for the extension to take effect.
+
+> **No tray icon after following the steps above?**
+> Run the app from a terminal — if the tray fails it prints the exact error and keeps the LED matrix running headless. You can still use it without the tray; the config file at `~/.config/LedControl/config.json` can be edited by hand.
 
 ### 3 — Run the app
 
