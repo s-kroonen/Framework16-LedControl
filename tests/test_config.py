@@ -8,17 +8,16 @@ from unittest.mock import patch
 from led_control.config import ALL_STAT_KEYS, NUM_SLOTS
 
 
+def _env(tmp_path: Path) -> dict:
+    """Env-var overrides that redirect the config dir on both Windows and Linux."""
+    return {"APPDATA": str(tmp_path), "XDG_CONFIG_HOME": str(tmp_path)}
+
+
 def _cfg(tmp_path):
     """Return a fresh Config backed by tmp_path."""
     from led_control.config import Config
-    with patch.dict(os.environ, {"APPDATA": str(tmp_path)}):
+    with patch.dict(os.environ, _env(tmp_path)):
         return Config()
-
-
-def _cfg_ctx(tmp_path):
-    """Context-manager helper that keeps the APPDATA patch alive."""
-    from led_control.config import Config
-    return patch.dict(os.environ, {"APPDATA": str(tmp_path)}), Config
 
 
 # ---------------------------------------------------------------------------
@@ -35,8 +34,6 @@ def test_defaults(tmp_path):
 def test_bar_slots_default_is_9_items(tmp_path):
     cfg = _cfg(tmp_path)
     assert len(cfg.bar_slots) == NUM_SLOTS
-    # Default slots are a curated 9 (ALL_STAT_KEYS has 11 — disk_read and
-    # disk_write are available but not shown by default)
     assert "cpu" in cfg.bar_slots
     assert "disk" in cfg.bar_slots
     assert all(k in ALL_STAT_KEYS for k in cfg.bar_slots if k is not None)
@@ -44,7 +41,7 @@ def test_bar_slots_default_is_9_items(tmp_path):
 
 def test_save_and_reload(tmp_path):
     from led_control.config import Config
-    with patch.dict(os.environ, {"APPDATA": str(tmp_path)}):
+    with patch.dict(os.environ, _env(tmp_path)):
         cfg = Config()
         cfg.mode = "clock"
         cfg.brightness = 42
@@ -62,7 +59,7 @@ def test_save_and_reload(tmp_path):
 def test_unknown_keys_in_file_are_ignored(tmp_path):
     import pytest
     from led_control import config as cfg_mod
-    with patch.dict(os.environ, {"APPDATA": str(tmp_path)}):
+    with patch.dict(os.environ, _env(tmp_path)):
         cfg_dir = Path(tmp_path) / "LedControl"
         cfg_dir.mkdir(parents=True, exist_ok=True)
         (cfg_dir / "config.json").write_text(
@@ -76,7 +73,7 @@ def test_unknown_keys_in_file_are_ignored(tmp_path):
 
 def test_invalid_bar_slot_keys_become_none(tmp_path):
     from led_control.config import Config
-    with patch.dict(os.environ, {"APPDATA": str(tmp_path)}):
+    with patch.dict(os.environ, _env(tmp_path)):
         cfg_dir = Path(tmp_path) / "LedControl"
         cfg_dir.mkdir(parents=True, exist_ok=True)
         (cfg_dir / "config.json").write_text(
@@ -91,7 +88,7 @@ def test_invalid_bar_slot_keys_become_none(tmp_path):
 
 def test_short_slot_list_padded_to_9(tmp_path):
     from led_control.config import Config
-    with patch.dict(os.environ, {"APPDATA": str(tmp_path)}):
+    with patch.dict(os.environ, _env(tmp_path)):
         cfg_dir = Path(tmp_path) / "LedControl"
         cfg_dir.mkdir(parents=True, exist_ok=True)
         (cfg_dir / "config.json").write_text(
