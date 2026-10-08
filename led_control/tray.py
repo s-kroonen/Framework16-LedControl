@@ -48,6 +48,34 @@ from .config import ALL_STAT_KEYS, ALERT_MODES, ALERT_MODE_LABELS, STAT_LABELS, 
 log = logging.getLogger(__name__)
 
 
+def _patch_pystray_icon_suffix() -> None:
+    """Give pystray's temp tray-icon file a .png suffix.
+
+    pystray's GTK/AppIndicator backend writes the icon via
+    tempfile.mktemp() with no extension. GNOME's AppIndicator extension
+    identifies the icon file by its suffix, not by sniffing file
+    contents — an extensionless file silently fails to load as an icon,
+    leaving the indicator docked but with no working click target.
+    """
+    try:
+        from pystray._util.gtk import GtkIcon
+    except ImportError:
+        return
+
+    import tempfile as _tempfile
+
+    def _update_fs_icon(self):
+        self._icon_path = _tempfile.mktemp(suffix=".png")
+        with open(self._icon_path, "wb") as f:
+            self.icon.save(f, "PNG")
+        self._icon_valid = True
+
+    GtkIcon._update_fs_icon = _update_fs_icon
+
+
+_patch_pystray_icon_suffix()
+
+
 def _print_tray_help() -> None:
     """Print actionable fix instructions when the tray icon fails on Linux."""
     import sys
